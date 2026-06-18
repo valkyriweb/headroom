@@ -18,7 +18,9 @@ spot bad clients without taking the proxy down.
 
 from __future__ import annotations
 
+import base64
 import enum
+import json
 import logging
 from collections.abc import Mapping
 from typing import Any
@@ -68,6 +70,8 @@ SUBSCRIPTION_UA_PREFIXES: tuple[str, ...] = (
     "antigravity/",
 )
 
+_OPENAI_AUTH_CLAIM_NAMESPACE = "https://api.openai.com/auth"
+
 
 def _header_get(headers: Mapping[str, Any] | Any, name: str) -> str:
     """Read a single header, case-insensitively, returning ``""`` on miss.
@@ -108,6 +112,34 @@ def _header_get(headers: Mapping[str, Any] | Any, name: str) -> str:
     return str(value)
 
 
+def _decode_bearer_jwt_payload(headers: Mapping[str, Any] | Any) -> dict[str, Any] | None:
+    """Best-effort JWT payload decode for routing/classification hints only."""
+    auth = _header_get(headers, "authorization")
+    scheme, _, token = auth.partition(" ")
+    if scheme.lower() != "bearer" or token.count(".") < 2:
+        return None
+
+    payload = token.split(".", 2)[1]
+    payload += "=" * (-len(payload) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(payload.encode("ascii"))
+        data = json.loads(decoded.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _has_chatgpt_codex_subscription_hint(headers: Mapping[str, Any] | Any) -> bool:
+    """Return True for ChatGPT/Codex subscription auth forwarded by Codex/Pi."""
+    if _header_get(headers, "chatgpt-account-id").strip():
+        return True
+
+    payload = _decode_bearer_jwt_payload(headers)
+    auth_claims = payload.get(_OPENAI_AUTH_CLAIM_NAMESPACE) if isinstance(payload, dict) else None
+    account_id = auth_claims.get("chatgpt_account_id") if isinstance(auth_claims, dict) else None
+    return isinstance(account_id, str) and bool(account_id.strip())
+
+
 def classify_auth_mode(headers: Mapping[str, Any] | Any) -> AuthMode:
     """Classify the auth mode of an inbound request from its headers.
 
@@ -117,22 +149,25 @@ def classify_auth_mode(headers: Mapping[str, Any] | Any) -> AuthMode:
        The CLI's own auth-mode wins over the bearer token shape it
        happens to be carrying — a Claude Code session uses a
        ``sk-ant-oat-*`` token but is a subscription client, not OAuth.
-    2. **``Authorization: Bearer sk-ant-oat-*``** → :data:`AuthMode.OAUTH`
+    2. **ChatGPT/Codex account header or JWT claim** →
+       :data:`AuthMode.SUBSCRIPTION` (Codex CLI / Pi Codex subscription auth).
+    3. **``Authorization: Bearer sk-ant-oat-*``** → :data:`AuthMode.OAUTH`
        (Claude Pro / Max OAuth). Checked before the broader ``sk-``
        PAYG rule because ``sk-ant-oat-`` shares the ``sk-`` prefix.
-    3. **``Authorization: Bearer sk-ant-api*`` or ``Bearer sk-*``** →
+    4. **``Authorization: Bearer sk-ant-api*`` or ``Bearer sk-*``** →
        :data:`AuthMode.PAYG` (Anthropic / OpenAI API key).
-    4. **``Authorization: Bearer <jwt>``** (3 dot-separated segments)
-       → :data:`AuthMode.OAUTH` (Codex / Cursor / Copilot OAuth).
-    5. **``Authorization`` present but not ``Bearer ...``** →
+    5. **``Authorization: Bearer <jwt>``** (3 dot-separated segments)
+       → :data:`AuthMode.OAUTH` (Cursor / Copilot OAuth, unless it has
+       the ChatGPT/Codex subscription claim handled above).
+    6. **``Authorization`` present but not ``Bearer ...``** →
        :data:`AuthMode.OAUTH` (AWS SigV4 ``AWS4-HMAC-SHA256 ...`` →
        Bedrock; any other non-Bearer scheme is presumed
        passthrough-prefer too).
-    6. **``x-api-key`` present** → :data:`AuthMode.PAYG` (Anthropic
+    7. **``x-api-key`` present** → :data:`AuthMode.PAYG` (Anthropic
        API key style).
-    7. **``x-goog-api-key`` present** → :data:`AuthMode.PAYG` (Gemini
+    8. **``x-goog-api-key`` present** → :data:`AuthMode.PAYG` (Gemini
        key).
-    8. **Default** → :data:`AuthMode.PAYG` (safest default; aggressive
+    9. **Default** → :data:`AuthMode.PAYG` (safest default; aggressive
        compression on a misclassified request just costs us a re-run,
        not a revoked subscription).
 
@@ -145,6 +180,14 @@ def classify_auth_mode(headers: Mapping[str, Any] | Any) -> AuthMode:
     for prefix in SUBSCRIPTION_UA_PREFIXES:
         if prefix in ua_lower:
             return AuthMode.SUBSCRIPTION
+
+    # ── ChatGPT/Codex subscription auth ───────────────────────────
+    # Pi's OpenAI-Codex provider uses its own User-Agent (`pi (...)`) but
+    # forwards ChatGPT subscription auth with `chatgpt-account-id` and/or the
+    # same account id claim embedded in the OAuth JWT. Treat it like Codex CLI
+    # for compression-policy purposes so history rewrites stay live-zone-only.
+    if _has_chatgpt_codex_subscription_hint(headers):
+        return AuthMode.SUBSCRIPTION
 
     # ── Authorization header ──────────────────────────────────────
     auth = _header_get(headers, "authorization")
@@ -229,7 +272,8 @@ def classify_client(headers: Mapping[str, Any] | Any, *, default: str | None = N
        — covers the unmodified-client case. Substring, not prefix,
        because some clients prepend a corporate-wrapper UA before
        their own.
-    3. **None** when neither produces a hit. ``None`` is the loud
+    3. **ChatGPT/Codex subscription auth hint** → ``codex``.
+    4. **None** when neither produces a hit. ``None`` is the loud
        "unknown harness" signal; downstream consumers can group
        these as "unidentified" rather than silently bucketing them
        into a default.
@@ -245,11 +289,14 @@ def classify_client(headers: Mapping[str, Any] | Any, *, default: str | None = N
         return explicit
     # 2. User-Agent substring match
     ua_lower = _header_get(headers, "user-agent").lower()
-    if not ua_lower:
-        return None
-    for needle, name in CLIENT_UA_MAP:
-        if needle in ua_lower:
-            return name
+    if ua_lower:
+        for needle, name in CLIENT_UA_MAP:
+            if needle in ua_lower:
+                return name
+    # 3. ChatGPT/Codex subscription auth hint. Pi's UA is `pi (...)`, so this
+    # catches the real subscription route even when no explicit X-Client exists.
+    if _has_chatgpt_codex_subscription_hint(headers):
+        return "codex"
     return default
 
 

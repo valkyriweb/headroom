@@ -42,6 +42,28 @@ fn oauth_jwt_classified_oauth() {
 }
 
 #[test]
+fn chatgpt_account_header_classified_subscription() {
+    // Pi Codex forwards ChatGPT subscription auth under its own `pi (...)` UA.
+    let h = headers(&[
+        ("authorization", "Bearer header.payload.sig"),
+        ("chatgpt-account-id", "acct_test"),
+        ("user-agent", "pi (darwin 25.0.0; arm64)"),
+    ]);
+    assert_eq!(classify(&h), AuthMode::Subscription);
+}
+
+#[test]
+fn chatgpt_account_jwt_claim_classified_subscription() {
+    // Payload: {"https://api.openai.com/auth":{"chatgpt_account_id":"acct_test"}}
+    let jwt = "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF90ZXN0In19.sig";
+    let h = headers(&[
+        ("authorization", &format!("Bearer {jwt}")),
+        ("user-agent", "pi (darwin 25.0.0; arm64)"),
+    ]);
+    assert_eq!(classify(&h), AuthMode::Subscription);
+}
+
+#[test]
 fn oauth_sk_ant_oat_classified_oauth() {
     // Claude Pro / Max OAuth: `Bearer sk-ant-oat-...`.
     let h = headers(&[("authorization", "Bearer sk-ant-oat-01-abc123def456")]);

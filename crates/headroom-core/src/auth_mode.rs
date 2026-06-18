@@ -86,6 +86,66 @@ const SUBSCRIPTION_UA_PREFIXES: &[&str] = &[
     "antigravity/",
 ];
 
+const OPENAI_AUTH_CLAIM_NAMESPACE: &str = "https://api.openai.com/auth";
+
+fn decode_base64_url_no_pad(input: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buffer = 0_u32;
+    let mut bits = 0_u8;
+
+    for byte in input.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            b'=' => break,
+            _ => return None,
+        } as u32;
+        buffer = (buffer << 6) | value;
+        bits += 6;
+        while bits >= 8 {
+            bits -= 8;
+            out.push(((buffer >> bits) & 0xff) as u8);
+        }
+    }
+
+    Some(out)
+}
+
+fn has_chatgpt_codex_subscription_hint(headers: &HeaderMap) -> bool {
+    if headers
+        .get("chatgpt-account-id")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return true;
+    }
+
+    let auth = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let Some(token) = auth.strip_prefix("Bearer ") else {
+        return false;
+    };
+    let Some(payload) = token.split('.').nth(1) else {
+        return false;
+    };
+    let Some(decoded) = decode_base64_url_no_pad(payload) else {
+        return false;
+    };
+    let Ok(data) = serde_json::from_slice::<serde_json::Value>(&decoded) else {
+        return false;
+    };
+
+    data.get(OPENAI_AUTH_CLAIM_NAMESPACE)
+        .and_then(|claims| claims.get("chatgpt_account_id"))
+        .and_then(|account_id| account_id.as_str())
+        .is_some_and(|account_id| !account_id.trim().is_empty())
+}
+
 /// Classify the auth mode of an inbound request from its headers.
 ///
 /// Decision order (most-specific signal wins):
@@ -94,21 +154,24 @@ const SUBSCRIPTION_UA_PREFIXES: &[&str] = &[
 ///    The CLI's own auth-mode wins over the bearer token shape it
 ///    happens to be carrying — a Claude Code session uses a
 ///    `sk-ant-oat-*` token but is a subscription client, not OAuth.
-/// 2. **`Authorization: Bearer sk-ant-oat-*`** → [`AuthMode::OAuth`]
+/// 2. **ChatGPT/Codex account header or JWT claim** →
+///    [`AuthMode::Subscription`] (Codex CLI / Pi Codex subscription auth).
+/// 3. **`Authorization: Bearer sk-ant-oat-*`** → [`AuthMode::OAuth`]
 ///    (Claude Pro / Max OAuth). Checked before the broader `sk-` PAYG
 ///    rule because `sk-ant-oat-` shares the `sk-` prefix.
-/// 3. **`Authorization: Bearer sk-ant-api*` or `Bearer sk-*`** →
+/// 4. **`Authorization: Bearer sk-ant-api*` or `Bearer sk-*`** →
 ///    [`AuthMode::Payg`] (Anthropic / OpenAI API key).
-/// 4. **`Authorization: Bearer <jwt>`** (3 dot-separated segments) →
-///    [`AuthMode::OAuth`] (Codex / Cursor / Copilot OAuth).
-/// 5. **`Authorization` present but not `Bearer ...`** →
+/// 5. **`Authorization: Bearer <jwt>`** (3 dot-separated segments) →
+///    [`AuthMode::OAuth`] (Cursor / Copilot OAuth, unless it has the
+///    ChatGPT/Codex subscription claim handled above).
+/// 6. **`Authorization` present but not `Bearer ...`** →
 ///    [`AuthMode::OAuth`] (AWS SigV4 `AWS4-HMAC-SHA256 ...` →
 ///    Bedrock; any other non-Bearer scheme is presumed
 ///    passthrough-prefer too).
-/// 6. **`x-api-key` present** → [`AuthMode::Payg`] (Anthropic API key
+/// 7. **`x-api-key` present** → [`AuthMode::Payg`] (Anthropic API key
 ///    style).
-/// 7. **`x-goog-api-key` present** → [`AuthMode::Payg`] (Gemini key).
-/// 8. **Default** → [`AuthMode::Payg`] (safest default; aggressive
+/// 8. **`x-goog-api-key` present** → [`AuthMode::Payg`] (Gemini key).
+/// 9. **Default** → [`AuthMode::Payg`] (safest default; aggressive
 ///    compression on a misclassified request just costs us a re-run,
 ///    not a revoked subscription).
 ///
@@ -141,6 +204,15 @@ pub fn classify(headers: &HeaderMap) -> AuthMode {
         .iter()
         .any(|prefix| ua_owned.contains(prefix))
     {
+        return AuthMode::Subscription;
+    }
+
+    // ── ChatGPT/Codex subscription auth ──────────────────────────
+    // Pi's OpenAI-Codex provider uses its own User-Agent (`pi (...)`) but
+    // forwards ChatGPT subscription auth with `chatgpt-account-id` and/or the
+    // same account id claim embedded in the OAuth JWT. Treat it like Codex CLI
+    // for compression-policy purposes so history rewrites stay live-zone-only.
+    if has_chatgpt_codex_subscription_hint(headers) {
         return AuthMode::Subscription;
     }
 
@@ -246,5 +318,25 @@ mod inline_tests {
             HeaderValue::from_bytes(b"\xFFnope").unwrap(),
         );
         assert_eq!(classify(&headers), AuthMode::Payg);
+    }
+
+    #[test]
+    fn chatgpt_account_header_is_subscription() {
+        let mut headers = HeaderMap::new();
+        headers.insert("chatgpt-account-id", HeaderValue::from_static("acct_test"));
+        headers.insert("user-agent", HeaderValue::from_static("pi (darwin; arm64)"));
+        assert_eq!(classify(&headers), AuthMode::Subscription);
+    }
+
+    #[test]
+    fn chatgpt_account_claim_is_subscription() {
+        // Payload: {"https://api.openai.com/auth":{"chatgpt_account_id":"acct_test"}}
+        let jwt = "eyJhbGciOiJub25lIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF90ZXN0In19.sig";
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {jwt}")).unwrap(),
+        );
+        assert_eq!(classify(&headers), AuthMode::Subscription);
     }
 }

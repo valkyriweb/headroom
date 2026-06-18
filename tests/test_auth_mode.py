@@ -8,6 +8,8 @@ running both suites side by side.
 
 from __future__ import annotations
 
+import base64
+import json
 import time
 
 import pytest
@@ -25,6 +27,14 @@ def _h(**pairs: str) -> dict[str, str]:
     return dict(pairs)
 
 
+def _jwt_with_payload(payload: dict[str, object]) -> str:
+    def enc(data: dict[str, object]) -> str:
+        raw = json.dumps(data, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    return f"{enc({'alg': 'none'})}.{enc(payload)}.sig"
+
+
 # ── Required matrix ──────────────────────────────────────────────
 
 
@@ -39,6 +49,27 @@ def test_oauth_jwt_classified_oauth() -> None:
     jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0In0.signaturepart"
     headers = {"authorization": f"Bearer {jwt}"}
     assert classify_auth_mode(headers) is AuthMode.OAUTH
+
+
+def test_chatgpt_account_header_classified_subscription() -> None:
+    """Pi Codex forwards ChatGPT subscription auth under its own ``pi (...)`` UA."""
+    headers = {
+        "authorization": "Bearer header.payload.sig",
+        "chatgpt-account-id": "acct_test",
+        "user-agent": "pi (darwin 25.0.0; arm64)",
+    }
+    assert classify_auth_mode(headers) is AuthMode.SUBSCRIPTION
+    assert classify_client(headers) == "codex"
+
+
+def test_chatgpt_account_jwt_claim_classified_subscription() -> None:
+    """Codex subscription JWT claim is enough when the explicit account header is absent."""
+    jwt = _jwt_with_payload(
+        {"https://api.openai.com/auth": {"chatgpt_account_id": "acct_test"}}
+    )
+    headers = {"authorization": f"Bearer {jwt}", "user-agent": "pi (darwin 25.0.0; arm64)"}
+    assert classify_auth_mode(headers) is AuthMode.SUBSCRIPTION
+    assert classify_client(headers) == "codex"
 
 
 def test_oauth_sk_ant_oat_classified_oauth() -> None:
@@ -193,3 +224,9 @@ def test_classify_client_uses_default_when_no_client_signal():
     headers = {"user-agent": "anthropic/0.42.0"}
 
     assert classify_client(headers, default="claude") == "claude"
+
+
+def test_classify_client_chatgpt_codex_hint_wins_over_default():
+    headers = {"chatgpt-account-id": "acct_test", "user-agent": "pi (darwin 25.0.0; arm64)"}
+
+    assert classify_client(headers, default="unknown") == "codex"
