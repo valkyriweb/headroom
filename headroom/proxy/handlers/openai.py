@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
+from headroom.config import DEFAULT_EXCLUDE_TOOLS
 from headroom.copilot_auth import apply_copilot_api_auth, build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import (
@@ -730,6 +731,10 @@ class OpenAIHandlerMixin:
         unit_target_ratio = profile_kwargs.get("target_ratio")
         if unit_target_ratio is not None:
             unit_target_ratio = float(unit_target_ratio)
+        router_config = getattr(router, "config", None)
+        exclude_tools = getattr(router_config, "exclude_tools", None)
+        if exclude_tools is None:
+            exclude_tools = DEFAULT_EXCLUDE_TOOLS
 
         try:
             tokenizer = self.openai_provider.get_token_counter(model)
@@ -741,28 +746,45 @@ class OpenAIHandlerMixin:
             )
             return payload, False, 0, [], {}, [], 0
 
-        def _slot_text(item: dict[str, Any]) -> tuple[str, tuple[str, int | None]] | None:
+        def _slot_texts(item: dict[str, Any]) -> list[tuple[str, tuple[str, int | None]]]:
             # Only tool-output items are eligible for in-place compression.
             # Message items (user/system/assistant) sit inside the request's
             # cacheable prefix; mutating them busts prefix caching on every
             # subsequent turn. Role-level guards in compression_units.py
             # remain as defense-in-depth.
             type_tag = item.get("type")
-            if type_tag in self.OPENAI_RESPONSES_OUTPUT_TYPES:
-                output = item.get("output")
-                if isinstance(output, str):
-                    return output, ("output", None)
-            return None
+            if type_tag not in self.OPENAI_RESPONSES_OUTPUT_TYPES:
+                return []
+            output = item.get("output")
+            if isinstance(output, str):
+                return [(output, ("output", None))]
+            if isinstance(output, list):
+                slots: list[tuple[str, tuple[str, int | None]]] = []
+                for part_idx, part in enumerate(output):
+                    if not isinstance(part, dict):
+                        continue
+                    if part.get("type") != "input_text":
+                        continue
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        slots.append((text, ("output_part_text", part_idx)))
+                return slots
+            return []
 
         def _set_slot_text(
             item: dict[str, Any],
             slot: tuple[str, int | None],
             replacement: str,
         ) -> None:
-            kind, _ = slot
+            kind, part_idx = slot
             if kind == "output":
                 item["output"] = replacement
+            elif kind == "output_part_text" and part_idx is not None:
+                output = item.get("output")
+                if isinstance(output, list) and part_idx < len(output) and isinstance(output[part_idx], dict):
+                    output[part_idx]["text"] = replacement
 
+        tool_names_by_call_id: dict[str, str] = {}
         headroom_retrieve_call_ids: set[str] = set()
         for item in items:
             if not isinstance(item, dict):
@@ -770,11 +792,10 @@ class OpenAIHandlerMixin:
             if item.get("type") != "function_call":
                 continue
             name = item.get("name")
-            if isinstance(name, str) and (
-                name == "headroom_retrieve" or name.endswith("__headroom_retrieve")
-            ):
-                call_id = item.get("call_id")
-                if isinstance(call_id, str) and call_id:
+            call_id = item.get("call_id")
+            if isinstance(name, str) and isinstance(call_id, str) and call_id:
+                tool_names_by_call_id[call_id] = name
+                if name == "headroom_retrieve" or name.endswith("__headroom_retrieve"):
                     headroom_retrieve_call_ids.add(call_id)
 
         timing_sink: dict[str, float] = timing if timing is not None else {}
@@ -785,7 +806,7 @@ class OpenAIHandlerMixin:
             )
 
         extraction_started = time.perf_counter()
-        candidates: list[tuple[int, tuple[str, int | None], str]] = []
+        candidates: list[tuple[int, tuple[str, int | None], str, str | None]] = []
         extraction_debug: list[dict[str, Any]] = []
         for idx, item in enumerate(items):
             if not isinstance(item, dict):
@@ -803,6 +824,7 @@ class OpenAIHandlerMixin:
             item_type = item.get("type")
             if item_type in self.OPENAI_RESPONSES_OUTPUT_TYPES:
                 call_id = item.get("call_id")
+                tool_name = tool_names_by_call_id.get(call_id) if isinstance(call_id, str) else None
                 if isinstance(call_id, str) and call_id in headroom_retrieve_call_ids:
                     if debug_enabled:
                         extraction_debug.append(
@@ -812,29 +834,46 @@ class OpenAIHandlerMixin:
                                 "reason": "headroom_retrieve_output_protected",
                                 "item_type": item_type,
                                 "call_id": call_id,
+                                "tool_name": tool_name,
                                 "item": item,
                             }
                         )
                     continue
-                slot = _slot_text(item)
-                if slot is not None:
-                    text, slot_ref = slot
-                    candidates.append((idx, slot_ref, text))
+                if tool_name in exclude_tools:
                     if debug_enabled:
                         extraction_debug.append(
                             {
                                 "index": idx,
-                                "eligible": True,
+                                "eligible": False,
+                                "reason": "excluded_tool_output",
                                 "item_type": item_type,
-                                "role": item.get("role"),
-                                "slot": slot_ref,
-                                "text_chars": len(text),
-                                "text_bytes": len(text.encode("utf-8", errors="replace")),
-                                "text_json_shape": _json_shape(text),
+                                "call_id": call_id,
+                                "tool_name": tool_name,
                                 "item": item,
-                                "text": text,
                             }
                         )
+                    continue
+                slots = _slot_texts(item)
+                if slots:
+                    for text, slot_ref in slots:
+                        candidates.append((idx, slot_ref, text, tool_name))
+                        if debug_enabled:
+                            extraction_debug.append(
+                                {
+                                    "index": idx,
+                                    "eligible": True,
+                                    "item_type": item_type,
+                                    "role": item.get("role"),
+                                    "call_id": call_id,
+                                    "tool_name": tool_name,
+                                    "slot": slot_ref,
+                                    "text_chars": len(text),
+                                    "text_bytes": len(text.encode("utf-8", errors="replace")),
+                                    "text_json_shape": _json_shape(text),
+                                    "item": item,
+                                    "text": text,
+                                }
+                            )
                 else:
                     if debug_enabled:
                         extraction_debug.append(
@@ -906,10 +945,16 @@ class OpenAIHandlerMixin:
 
         unit_build_started = time.perf_counter()
         unit_debug: list[dict[str, Any]] = []
-        for item_idx, slot_ref, original_text in candidates:
+        for item_idx, slot_ref, original_text, tool_name in candidates:
             item = items[item_idx] if item_idx < len(items) else {}
             item_type = item.get("type", "unknown") if isinstance(item, dict) else "unknown"
             role = str(item.get("role") or "tool") if isinstance(item, dict) else "tool"
+            bias = 1.0
+            if tool_name is not None:
+                try:
+                    bias = float(router._get_tool_bias(tool_name))
+                except Exception:
+                    bias = 1.0
             unit = CompressionUnit(
                 text=original_text,
                 provider="openai",
@@ -918,7 +963,9 @@ class OpenAIHandlerMixin:
                 item_type=str(item_type),
                 cache_zone="live",
                 mutable=True,
+                bias=bias,
                 min_bytes=self.OPENAI_RESPONSES_ROUTER_MIN_BYTES,
+                metadata={"tool_name": tool_name} if tool_name else {},
             )
             routed_units.append(RoutedCompressionUnit(unit=unit, slot=(item_idx, slot_ref)))
             if debug_enabled:
@@ -932,6 +979,8 @@ class OpenAIHandlerMixin:
                         "item_type": unit.item_type,
                         "cache_zone": unit.cache_zone,
                         "mutable": unit.mutable,
+                        "bias": unit.bias,
+                        "tool_name": tool_name,
                         "min_bytes": unit.min_bytes,
                         "text_chars": len(unit.text),
                         "text_bytes": len(unit.text.encode("utf-8", errors="replace")),

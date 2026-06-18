@@ -202,22 +202,26 @@ class AnchorConfig:
 # Default tools to exclude from compression (local file/code tools)
 # Read: Returns exact file content needed for Edit tool's old_string matching.
 #   Compressing would break the edit workflow.
-# Glob: Returns compact file path lists used for navigation. Low token count,
-#   not worth compressing.
+# Glob/Find/Ls: Return compact path/navigation data. Low token count and often
+#   exact inputs for follow-up reads/edits, so not worth compressing.
 # Tool outputs that are reference data and must NOT be compressed.
-# Read/Glob/Grep contain exact file contents/search results the agent needs for edits.
+# Read/Glob/Find/Ls/Grep contain exact file contents/search results the agent needs for edits.
 # Write/Edit record what changes were made — compressing them causes duplicate/conflicting edits.
 # Bash is NOT excluded — its outputs (build logs, test output) are ideal compression targets.
 DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
     {
         "Read",
         "Glob",
+        "Find",
+        "Ls",
         "Grep",
         "Write",
         "Edit",
         # Lowercase variants for case-insensitive matching
         "read",
         "glob",
+        "find",
+        "ls",
         "grep",
         "write",
         "edit",

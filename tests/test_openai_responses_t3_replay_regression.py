@@ -214,3 +214,185 @@ def test_t3_failed_size_exact_tool_output_cache_survives_history_changes():
         *[f"cached summary for tool={index}" for index in range(case.unit_count)],
         f"cached summary for tool={case.unit_count}",
     ]
+
+
+def _payload_for_named_tool(tool_name: str, output: str) -> dict:
+    return {
+        "model": "gpt-5.4-mini",
+        "input": [
+            {
+                "type": "function_call",
+                "call_id": "call-tool",
+                "name": tool_name,
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call-tool",
+                "output": output,
+            },
+        ],
+    }
+
+
+def test_openai_responses_live_compression_excludes_exact_file_tool_outputs():
+    router = ContentRouter()
+    calls = {"count": 0}
+
+    def compress(self, content: str, **_kwargs):
+        calls["count"] += 1
+        return RouterCompressionResult(
+            compressed="compressed exact output",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    output = "\n".join(f"{line:04d}: export const value = 'xxxxxxxx';" for line in range(1_000))
+
+    for tool_name in ("read", "grep", "find", "ls", "write", "edit", "Glob"):
+        payload = _payload_for_named_tool(tool_name, output)
+
+        new_payload, modified, saved, transforms, units_by_category, _strategy_chain, attempted = (
+            handler._compress_openai_responses_live_text_units_with_router(
+                payload,
+                model="gpt-5.4-mini",
+                request_id=f"codex_{tool_name}_exclusion",
+            )
+        )
+
+        assert modified is False, tool_name
+        assert saved == 0, tool_name
+        assert attempted == 0, tool_name
+        assert transforms == [], tool_name
+        assert units_by_category == {}, tool_name
+        assert new_payload["input"][1]["output"] == output, tool_name
+
+    assert calls["count"] == 0
+
+
+def test_openai_responses_live_compression_keeps_bash_outputs_eligible():
+    router = ContentRouter()
+
+    def compress(self, content: str, **_kwargs):
+        return RouterCompressionResult(
+            compressed="summarized bash output",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    output = "\n".join(f"2026-06-18T12:00:{line:02d}Z INFO build line={line}" for line in range(1_000))
+    payload = _payload_for_named_tool("bash", output)
+
+    new_payload, modified, saved, transforms, units_by_category, _strategy_chain, attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5.4-mini",
+            request_id="codex_bash_compression",
+        )
+    )
+
+    assert modified is True
+    assert saved > 0
+    assert attempted > 0
+    assert units_by_category == {"applied": 1}
+    assert "router:openai:responses:function_call_output:kompress" in transforms
+    assert new_payload["input"][1]["output"] == "summarized bash output"
+
+
+def test_openai_responses_live_compression_preserves_multimodal_image_parts():
+    router = ContentRouter()
+
+    def compress(self, content: str, **_kwargs):
+        return RouterCompressionResult(
+            compressed="summarized visual inspection text",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    image_url = "data:image/png;base64," + "A" * 2048
+    long_text = "\n".join(f"observation {line}: repeated detail" for line in range(500))
+    payload = {
+        "model": "gpt-5.4-mini",
+        "input": [
+            {"type": "function_call", "call_id": "call-browser", "name": "browser_screenshot", "arguments": "{}"},
+            {
+                "type": "function_call_output",
+                "call_id": "call-browser",
+                "output": [
+                    {"type": "input_text", "text": long_text},
+                    {"type": "input_image", "image_url": image_url, "detail": "high"},
+                ],
+            },
+        ],
+    }
+
+    new_payload, modified, saved, transforms, units_by_category, _strategy_chain, attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5.4-mini",
+            request_id="codex_multimodal_compression",
+        )
+    )
+
+    assert modified is True
+    assert saved > 0
+    assert attempted > 0
+    assert units_by_category == {"applied": 1}
+    assert "router:openai:responses:function_call_output:kompress" in transforms
+    output = new_payload["input"][1]["output"]
+    assert output[0] == {"type": "input_text", "text": "summarized visual inspection text"}
+    assert output[1] == {"type": "input_image", "image_url": image_url, "detail": "high"}
+
+
+def test_openai_responses_live_compression_excludes_multimodal_exact_tool_outputs():
+    router = ContentRouter()
+    calls = {"count": 0}
+
+    def compress(self, content: str, **_kwargs):
+        calls["count"] += 1
+        return RouterCompressionResult(
+            compressed="compressed read text",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    image_url = "data:image/png;base64," + "A" * 2048
+    long_text = "\n".join(f"file line {line}: exact content" for line in range(500))
+    payload = {
+        "model": "gpt-5.4-mini",
+        "input": [
+            {"type": "function_call", "call_id": "call-read", "name": "read", "arguments": "{}"},
+            {
+                "type": "function_call_output",
+                "call_id": "call-read",
+                "output": [
+                    {"type": "input_text", "text": long_text},
+                    {"type": "input_image", "image_url": image_url, "detail": "high"},
+                ],
+            },
+        ],
+    }
+
+    new_payload, modified, saved, transforms, units_by_category, _strategy_chain, attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5.4-mini",
+            request_id="codex_multimodal_read_exclusion",
+        )
+    )
+
+    assert modified is False
+    assert saved == 0
+    assert attempted == 0
+    assert transforms == []
+    assert units_by_category == {}
+    assert calls["count"] == 0
+    assert new_payload["input"][1]["output"] == payload["input"][1]["output"]
