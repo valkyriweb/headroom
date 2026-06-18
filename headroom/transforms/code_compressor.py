@@ -65,6 +65,7 @@ def _check_tree_sitter_available() -> bool:
     global _tree_sitter_available
     if _tree_sitter_available is None:
         try:
+            import tree_sitter  # noqa: F401
             import tree_sitter_language_pack  # noqa: F401
 
             _tree_sitter_available = True
@@ -73,33 +74,20 @@ def _check_tree_sitter_available() -> bool:
     return _tree_sitter_available
 
 
+class _LanguagePackParserAdapter:
+    """Normalize tree-sitter-language-pack's parser API to tree_sitter.Parser."""
+
+    def __init__(self, parser: Any):
+        self._parser = parser
+
+    def parse(self, source: bytes | bytearray | str) -> Any:
+        if isinstance(source, (bytes, bytearray)):
+            source = bytes(source).decode("utf-8", errors="replace")
+        return self._parser.parse(source)
+
+
 def _get_parser(language: str) -> Any:
-    """Get a tree-sitter parser for the given language.
-
-    Returns a **thread-local** ``tree_sitter.Parser`` instance.
-
-    tree-sitter ≥ 0.23 wraps the C ``TSParser`` in a PyO3
-    ``#[pyclass(unsendable)]`` which hard-panics if the object is accessed
-    from any thread other than its creator.  Because Headroom runs
-    compression inside a ``ThreadPoolExecutor``, a single shared parser
-    would be touched from arbitrary pool threads → instant crash.
-
-    We use the stock ``tree_sitter.Parser`` (which returns standard
-    ``tree_sitter.Node`` / ``tree_sitter.Tree`` with property access) and
-    set its language via ``tree_sitter_language_pack.get_language()``.
-    Storing one parser per (thread, language) satisfies the ``unsendable``
-    contract with negligible extra memory.
-
-    Args:
-        language: Language name (e.g., 'python', 'javascript').
-
-    Returns:
-        Configured ``tree_sitter.Parser`` bound to the current thread.
-
-    Raises:
-        ImportError: If tree-sitter is not installed.
-        ValueError: If language is not supported.
-    """
+    """Get a thread-local tree-sitter parser for the given language."""
     if not _check_tree_sitter_available():
         raise ImportError(
             "tree-sitter is not installed. Install with: pip install headroom-ai[code]\n"
@@ -113,13 +101,20 @@ def _get_parser(language: str) -> Any:
 
     if language not in parsers:
         try:
+            from tree_sitter import Language as TreeSitterLanguage
             from tree_sitter import Parser
-            from tree_sitter_language_pack import get_language
+            from tree_sitter_language_pack import get_language, get_parser
 
-            parser = Parser()
-            # `language` is a validated runtime str; get_language types its arg
-            # as a Literal of supported names, which a dynamic str can't satisfy.
-            parser.language = get_language(language)  # type: ignore[arg-type]
+            language_obj = get_language(language)  # type: ignore[arg-type]
+            if isinstance(language_obj, TreeSitterLanguage):
+                parser = Parser()
+                parser.language = language_obj
+            else:
+                # tree-sitter-language-pack 1.9.x returns its own `builtins.Language`
+                # object, which tree_sitter.Parser rejects. Its paired parser works,
+                # but expects str input instead of bytes; the adapter preserves the
+                # call shape used by the rest of this module.
+                parser = _LanguagePackParserAdapter(get_parser(language))  # type: ignore[arg-type]
             parsers[language] = parser
             logger.debug(
                 "Loaded tree-sitter parser for %s (thread %s)",

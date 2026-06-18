@@ -27,6 +27,7 @@ from headroom.transforms.code_compressor import (
 
 # Try to import for availability check
 try:
+    import tree_sitter  # noqa: F401
     import tree_sitter_language_pack  # noqa: F401
 
     TREE_SITTER_INSTALLED = True
