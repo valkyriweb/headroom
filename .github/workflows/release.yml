@@ -138,7 +138,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: "20"
+          node-version: "24"
 
       - name: Sync version to package files
         run: |
@@ -723,7 +723,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: "20"
+          node-version: "24"
           registry-url: ${{ env.NPM_REGISTRY_URL }}
 
       # No artifact download required: the publish steps below pack and
@@ -785,7 +785,7 @@ jobs:
       - name: Set up Node.js for GitHub Package Registry
         uses: actions/setup-node@v6
         with:
-          node-version: "20"
+          node-version: "24"
           registry-url: ${{ env.GITHUB_PACKAGES_REGISTRY_URL }}
 
       # No artifact download required: the publish-github-packages flow
