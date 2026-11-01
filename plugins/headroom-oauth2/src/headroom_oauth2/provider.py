@@ -130,7 +130,7 @@ class OAuth2ClientCredentials:
         except HTTPError as e:
             try:
                 e.read()  # drain; do NOT surface the IdP body (may echo sensitive context)
-            except Exception:
+            except Exception:  # noqa: BLE001, S110 - never expose the IdP response body
                 pass
             raise OAuth2Error(f"token endpoint returned HTTP {e.code}") from None
         except (URLError, OSError) as e:
