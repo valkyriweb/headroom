@@ -1,0 +1,52 @@
+name: Dependency checks
+on:
+  pull_request:
+    paths:
+      - 'Cargo.lock'
+      - 'docs/package*.json'
+      - 'plugins/openclaw/package*.json'
+      - 'sdk/typescript/package*.json'
+      - '.github/workflows/dependency-check.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  npm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      HEADROOM_INTEGRATION: '0'
+    strategy:
+      fail-fast: false
+      matrix:
+        directory: [sdk/typescript, plugins/openclaw]
+    defaults:
+      run:
+        working-directory: ${{ matrix.directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci --ignore-scripts
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      NEXT_TELEMETRY_DISABLED: '1'
+    defaults:
+      run:
+        working-directory: docs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci --ignore-scripts
+      - run: npx fumadocs-mdx
+      - run: npm run types:check
+      - run: npm run build
