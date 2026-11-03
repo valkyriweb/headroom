@@ -12,9 +12,9 @@ from .main import main
 @main.command()
 @click.option(
     "--hours",
-    type=float,
+    type=click.FloatRange(min=0),
     default=168.0,
-    help="Analyze logs from the last N hours (default: 168 = 7 days)",
+    help="Analyze logs from the last N hours (default: 168 = 7 days; 0 = all data)",
 )
 @click.option("--raw", is_flag=True, help="Show raw PERF records instead of report")
 @click.option(
@@ -28,7 +28,8 @@ def perf(hours: float, raw: bool, output_format: str) -> None:
     """Analyze proxy performance from logs.
 
     \b
-    Reads logs from ~/.headroom/logs/proxy.log and shows:
+    Reads logs from ~/.headroom/logs/proxy-*.log (per-worker and per-port,
+    with the legacy proxy.log as a fallback) and shows:
     - Token savings and compression effectiveness
     - Cache hit rates and prefix stability
     - Transform and routing breakdown
@@ -79,8 +80,13 @@ def perf(hours: float, raw: bool, output_format: str) -> None:
                 "tokens_before",
                 "tokens_after",
                 "tokens_saved",
+                "message_tokens_saved",
+                "tool_tokens_saved",
+                "prompt_reduction_tokens",
+                "accounting_delta_tokens",
                 "savings_pct",
                 "list_price_per_mtok",
+                "estimated_list_price_savings_usd",
             ]
             writer = csv.DictWriter(buf, fieldnames=fieldnames)
             writer.writeheader()

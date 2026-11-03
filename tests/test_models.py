@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 
 from headroom.models import (
@@ -11,6 +13,7 @@ from headroom.models import (
     list_models,
     register_model,
 )
+from tests._pricing_models import anthropic_pricing_model
 
 
 class TestModelInfo:
@@ -87,6 +90,49 @@ class TestModelRegistry:
         info = ModelRegistry.get("gpt-4o-new-version")
         assert info is not None
         assert info.name == "gpt-4o"
+
+    def test_get_prefix_matching_prefers_longest_registered_name(self):
+        """`gpt-4-32k-0613` must resolve to `gpt-4-32k` (32768), not the
+        shorter `gpt-4` (8192) that is registered first."""
+        info = ModelRegistry.get("gpt-4-32k-0613")
+        assert info is not None
+        assert info.name == "gpt-4-32k"
+        assert ModelRegistry.get_context_limit("gpt-4-32k-0613") == 32768
+
+    def test_get_prefix_matching_requires_version_boundary(self):
+        """`gpt-4.1`/`gpt-4.5` are distinct models, not variants of `gpt-4`.
+        A `.`-separated suffix must not match `gpt-4`, so they no longer
+        inherit gpt-4's 8192-token window (they fall back to the default)."""
+        assert ModelRegistry.get("gpt-4.1") is None
+        assert ModelRegistry.get("gpt-4.5-preview") is None
+        # Not silently reported as an 8192-token model:
+        assert ModelRegistry.get_context_limit("gpt-4.1") != 8192
+        assert ModelRegistry.get_context_limit("gpt-4.1", default=100) == 100
+
+    def test_resolve_future_google_family_fallback(self):
+        """Resolve should return provider-scoped fallbacks for plausible future models."""
+        with patch("headroom.models.registry.get_model_pricing", return_value=None):
+            info = ModelRegistry.resolve("gemini-3-pro-preview", provider="google")
+
+        assert info is not None
+        assert info.provider == "google"
+        assert info.context_window == 1000000
+        assert info.tokenizer_backend == "google"
+
+    def test_resolve_google_litellm_prefixed_family_fallback(self):
+        """Resolve should support LiteLLM-style Gemini provider prefixes."""
+        with patch("headroom.models.registry.get_model_pricing", return_value=None):
+            info = ModelRegistry.resolve("gemini/gemini-3-pro-preview", provider="google")
+
+        assert info is not None
+        assert info.provider == "google"
+        assert info.context_window == 1000000
+        assert info.tokenizer_backend == "google"
+
+    def test_resolve_does_not_claim_unrelated_models_for_google(self):
+        """Provider-scoped resolution should not mask unrelated model catalogs."""
+        assert ModelRegistry.resolve("not-a-google-model", provider="google") is None
+        assert ModelRegistry.resolve("gpt-4o", provider="google") is None
 
     def test_register_custom_model(self):
         """Test registering custom model."""
@@ -240,8 +286,9 @@ class TestBuiltInModels:
         info = get_model_info("claude-3-5-sonnet-20241022")
         assert info.provider == "anthropic"
         assert info.context_window == 200000
-        # Pricing fetched from LiteLLM (falls back to alias for retired models)
-        pricing = ModelRegistry.get_pricing("claude-sonnet-4-20250514")
+        # Pricing comes from litellm's live table, so name a model it currently
+        # prices; the retired-id path is the MODEL_ALIASES assertion below.
+        pricing = ModelRegistry.get_pricing(anthropic_pricing_model())
         assert pricing is not None
         assert pricing[0] == 3.00  # input cost per 1M
         assert pricing[1] == 15.00  # output cost per 1M
@@ -267,3 +314,27 @@ class TestBuiltInModels:
         info = get_model_info("mistral-large")
         assert info.provider == "mistral"
         assert info.supports_tools is True
+
+
+def test_deepseek_flash_is_registered_with_vision_and_legacy_aliases() -> None:
+    """The current DeepSeek id carries V4.1-Flash capabilities; retired ids alias it."""
+    from headroom.models.registry import ModelRegistry
+
+    flash = ModelRegistry.get("deepseek-flash")
+    assert flash is not None
+    assert flash.provider == "deepseek"
+    assert flash.context_window == 1_000_000
+    assert flash.max_output_tokens == 384_000
+    assert flash.supports_vision is True
+    assert flash.supports_tools is True
+    assert flash.tokenizer_backend == "huggingface"
+    assert set(flash.aliases) == {"deepseek-v4-flash", "deepseek-v4-flash-vision-exp"}
+
+    for alias in ("deepseek-v4-flash", "deepseek-v4-flash-vision-exp"):
+        resolved = ModelRegistry.get(alias)
+        assert resolved is not None
+        assert resolved.name == "deepseek-flash"
+
+    pro = ModelRegistry.get("deepseek-v4-pro")
+    assert pro is not None
+    assert pro.supports_vision is False

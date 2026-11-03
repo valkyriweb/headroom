@@ -137,7 +137,7 @@ config = HeadroomConfig(
 
 model = HeadroomAgnoModel(
     wrapped_model=OpenAIChat(id="gpt-4o"),
-    config=config,
+    headroom_config=config,
 )
 ```
 
@@ -167,6 +167,7 @@ Full async support for high-throughput applications:
 import asyncio
 from headroom.integrations.agno import HeadroomAgnoModel
 
+
 async def process_async():
     model = HeadroomAgnoModel(OpenAIChat(id="gpt-4o"))
 
@@ -178,6 +179,7 @@ async def process_async():
         print(chunk, end="", flush=True)
 
     print(f"\nTokens saved: {model.total_tokens_saved}")
+
 
 asyncio.run(process_async())
 ```
@@ -347,7 +349,7 @@ The integration operates at the model layer, not the agent layer. Some Agno feat
 ### Best Practices for Maximum Savings
 
 1. **Tool-heavy agents see the biggest wins** — Tool results (JSON, logs, search results) compress 70-90%
-2. **Long conversations benefit from RollingWindow** — Configure context limits to avoid hitting provider maximums
+2. **Long conversations are handled automatically** — Headroom compresses the newest tool outputs and content blocks in place (live-zone-only compression) and never drops messages from history, so the cache hot zone stays intact. No context-limit configuration is required.
 3. **Wrap at the model level, not agent level** — This ensures all LLM calls go through optimization
 4. **Use hooks for observability** — Track token usage patterns to identify optimization opportunities
 
@@ -360,7 +362,7 @@ We're tracking these potential enhancements:
 - **Tool schema deduplication** — Cache and reference repeated tool definitions
 - **Team-level optimization** — Shared context compression across agent teams
 
-Contributions welcome! See [CONTRIBUTING.md](https://github.com/chopratejas/headroom/blob/main/CONTRIBUTING.md).
+Contributions welcome! See [CONTRIBUTING.md](https://github.com/headroomlabs-ai/headroom/blob/main/CONTRIBUTING.md).
 
 ---
 
@@ -371,7 +373,7 @@ Contributions welcome! See [CONTRIBUTING.md](https://github.com/chopratejas/head
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `wrapped_model` | Any | Required | The Agno model to wrap |
-| `config` | `HeadroomConfig` | `None` | Custom configuration |
+| `headroom_config` | `HeadroomConfig` | `None` | Custom configuration |
 | `auto_detect_provider` | `bool` | `True` | Auto-detect provider for token counting |
 
 **Properties:**

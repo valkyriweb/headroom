@@ -33,14 +33,31 @@ _tree_sitter_local = threading.local()
 
 
 def _check_tree_sitter() -> bool:
-    """Check if tree-sitter is available."""
+    """Check if tree-sitter is available and can actually parse.
+
+    Constructs a parser and runs a minimal parse so that ABI mismatches
+    between ``tree_sitter`` and ``tree_sitter_language_pack`` surface here
+    instead of silently falling back to the text compressor at request time.
+    """
     global _tree_sitter_available
     if _tree_sitter_available is None:
         try:
-            import tree_sitter_language_pack  # noqa: F401
+            from tree_sitter import Parser
+            from tree_sitter_language_pack import get_language
 
+            parser = Parser()
+            parser.language = get_language("python")
+            tree = parser.parse(b"x = 1\n")
+            if tree.root_node.child_count == 0:
+                raise RuntimeError("tree-sitter parse returned empty tree")
             _tree_sitter_available = True
         except ImportError:
+            _tree_sitter_available = False
+        except Exception:
+            logger.warning(
+                "tree-sitter imported but failed to parse; "
+                "code-aware compression disabled (ABI mismatch?)"
+            )
             _tree_sitter_available = False
     return _tree_sitter_available
 
@@ -173,6 +190,15 @@ _STRUCTURAL_NODE_TYPES: dict[str, set[str]] = {
         "interface_declaration",
         "annotation",
     },
+    "perl": {
+        "use_statement",
+        "use_version_statement",
+        "subroutine_declaration_statement",
+        "method_declaration_statement",
+        "package_statement",
+        "class_statement",
+        "role_statement",
+    },
 }
 
 # Regex patterns for fallback detection
@@ -211,6 +237,10 @@ _SIGNATURE_PATTERNS: dict[str, list[re.Pattern[str]]] = {
         re.compile(r"^\s*(public\s+)?(class|interface|enum)\s+\w+", re.MULTILINE),
         re.compile(r"^\s*@\w+(\([^)]*\))?\s*$", re.MULTILINE),
     ],
+    "perl": [
+        re.compile(r"^\s*sub\s+\w+\s*(\([^)]*\))?", re.MULTILINE),
+        re.compile(r"^\s*(package|class|role)\s+[\w:]+", re.MULTILINE),
+    ],
 }
 
 # Body child node types for container definitions (classes, impls,
@@ -238,6 +268,7 @@ _LANGUAGE_MARKERS: dict[str, list[str]] = {
     "go": ["func ", "package ", "import (", "type "],
     "rust": ["fn ", "let mut", "impl ", "pub fn", "use "],
     "java": ["public class", "private ", "protected ", "void "],
+    "perl": ["sub ", "my $", "our $", "package ", "use strict"],
 }
 
 # Import patterns for fallback
@@ -248,6 +279,7 @@ _IMPORT_PATTERNS: dict[str, re.Pattern[str]] = {
     "go": re.compile(r'^\s*import\s+(\(|")', re.MULTILINE),
     "rust": re.compile(r"^\s*use\s+\w+", re.MULTILINE),
     "java": re.compile(r"^\s*import\s+[\w.]+;", re.MULTILINE),
+    "perl": re.compile(r"^\s*(use|require)\s+[\w:]+", re.MULTILINE),
 }
 
 
@@ -573,16 +605,24 @@ class CodeStructureHandler(BaseStructureHandler):
         returned unchanged. Otherwise a byte->char table is built once
         and every span endpoint is remapped.
         """
-        n_bytes = len(content.encode("utf-8"))
-        if n_bytes == len(content):
+        # ASCII fast path: every byte is one character, so tree-sitter's byte
+        # offsets are already character offsets. ``content.isascii()`` checks
+        # this in C without allocating, where ``len(content.encode("utf-8"))``
+        # built (and discarded) a full UTF-8 copy of the content on every code
+        # block just to compare lengths.
+        if content.isascii():
             return spans
 
         # byte_to_char[b] = index of the character containing byte b;
-        # byte_to_char[n_bytes] = len(content) so exclusive ends map.
+        # byte_to_char[n_bytes] = len(content) so exclusive ends map. A
+        # character's UTF-8 width is derived from its code point (1-4 bytes)
+        # rather than re-encoding every character individually in the loop.
+        n_bytes = len(content.encode("utf-8"))
         byte_to_char = [0] * (n_bytes + 1)
         byte_pos = 0
         for char_idx, ch in enumerate(content):
-            ch_width = len(ch.encode("utf-8"))
+            cp = ord(ch)
+            ch_width = 1 if cp < 0x80 else 2 if cp < 0x800 else 3 if cp < 0x10000 else 4
             for b in range(byte_pos, byte_pos + ch_width):
                 byte_to_char[b] = char_idx
             byte_pos += ch_width

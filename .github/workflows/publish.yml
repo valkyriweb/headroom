@@ -17,15 +17,17 @@ jobs:
       contents: write  # For uploading release assets
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0 # Keep in sync with rust-toolchain.toml.
 
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@v2
@@ -54,4 +56,4 @@ jobs:
           files: dist/headroom-sbom.cdx.json
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@v1.14.3

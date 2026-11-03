@@ -23,6 +23,8 @@ from typing import Any
 import pytest
 
 from headroom.memory.sync import (
+    _build_sync_backend,
+    _save_sync_state,
     sync,
     sync_export,
     sync_import,
@@ -461,6 +463,53 @@ class TestClaudeCodeAdapter:
         assert fm["source_agent"] == "codex"
         assert "FastAPI" in body
 
+    @pytest.mark.asyncio
+    async def test_write_distinct_memories_sharing_first_line_do_not_clobber(self, memory_dir):
+        """Two different memories that share a first line must not overwrite one
+        another. The filename slug is derived from the first line only, so before
+        the fix the second write clobbered the first (data loss)."""
+        adapter = ClaudeCodeAdapter(memory_dir)
+
+        written = await adapter.write_memories(
+            [
+                {
+                    "content": "# Project conventions\nUse tabs for indentation.",
+                    "headroom_id": "mem_a",
+                    "content_hash": "hash_a",
+                },
+                {
+                    "content": "# Project conventions\nDeploy on Fridays only.",
+                    "headroom_id": "mem_b",
+                    "content_hash": "hash_b",
+                },
+            ]
+        )
+
+        assert written == 2
+        files = sorted(memory_dir.glob("headroom_*.md"))
+        # Both memories must survive on disk (distinct files).
+        assert len(files) == 2
+        bodies = "\n".join(f.read_text() for f in files)
+        assert "tabs for indentation" in bodies
+        assert "Deploy on Fridays only" in bodies
+
+    @pytest.mark.asyncio
+    async def test_write_same_memory_updates_in_place(self, memory_dir):
+        """An update to the *same* memory (matching headroom_id) rewrites the
+        original slug file rather than spawning a disambiguated duplicate."""
+        adapter = ClaudeCodeAdapter(memory_dir)
+
+        await adapter.write_memories(
+            [{"content": "# Note\nfirst version", "headroom_id": "mem_x", "content_hash": "h1"}]
+        )
+        await adapter.write_memories(
+            [{"content": "# Note\nsecond version", "headroom_id": "mem_x", "content_hash": "h2"}]
+        )
+
+        files = list(memory_dir.glob("headroom_*.md"))
+        assert len(files) == 1
+        assert "second version" in files[0].read_text()
+
     def test_fingerprint_changes_on_modification(self, memory_dir):
         (memory_dir / "test.md").write_text("content 1")
 
@@ -535,11 +584,14 @@ class TestCodexAdapter:
         assert "Existing instructions" in content  # Preserved
 
     @pytest.mark.asyncio
-    async def test_write_replaces_existing_section(self, agents_md):
+    async def test_write_merges_into_existing_section(self, agents_md):
+        """Additive: an existing managed fact is preserved when a new one is
+        written. ``sync_export`` hands the adapter only the delta, so a
+        replace-the-whole-section write would erase prior memories."""
         agents_md.write_text(
             "# Instructions\n\n"
             "<!-- headroom:memory:start -->\n"
-            "## Old\n- old fact\n"
+            "## Headroom Shared Memory\n\n- old fact\n"
             "<!-- headroom:memory:end -->\n"
         )
 
@@ -548,14 +600,14 @@ class TestCodexAdapter:
 
         content = agents_md.read_text()
         assert "new fact" in content
-        assert "old fact" not in content
+        assert "old fact" in content  # preserved, not clobbered
 
     @pytest.mark.asyncio
-    async def test_write_replaces_existing_section_with_literal_backslashes(self, agents_md):
+    async def test_write_preserves_existing_fact_with_literal_backslashes(self, agents_md):
         agents_md.write_text(
             "# Instructions\n\n"
             "<!-- headroom:memory:start -->\n"
-            "## Old\n- old fact\n"
+            "## Headroom Shared Memory\n\n- old fact\n"
             "<!-- headroom:memory:end -->\n"
         )
 
@@ -563,9 +615,30 @@ class TestCodexAdapter:
         await adapter.write_memories([{"content": r"Use C:\Users\john.doe\repo and literal \u"}])
 
         content = agents_md.read_text()
+        # Backslashes / \u land literally (function replacement, not a template).
         assert r"C:\Users\john.doe\repo" in content
         assert r"literal \u" in content
-        assert "old fact" not in content
+        assert "old fact" in content  # preserved
+
+    @pytest.mark.asyncio
+    async def test_write_accumulates_across_syncs(self, agents_md):
+        """Regression: exporting deltas across successive syncs must accumulate,
+        not thrash between disjoint subsets."""
+        adapter = CodexAdapter(agents_md)
+
+        await adapter.write_memories([{"content": "fact A"}, {"content": "fact B"}])
+        # Second sync only sees the new memory as a delta.
+        added = await adapter.write_memories([{"content": "fact C"}])
+
+        content = agents_md.read_text()
+        assert "fact A" in content
+        assert "fact B" in content
+        assert "fact C" in content
+        assert added == 1
+        # Re-writing an already-present fact adds nothing and keeps the rest.
+        again = await adapter.write_memories([{"content": "fact A"}])
+        assert again == 0
+        assert (await adapter.read_memories()).__len__() == 3
 
     @pytest.mark.asyncio
     async def test_read_empty_agents_md(self, agents_md):
@@ -675,3 +748,62 @@ class TestCrossAgentInterop:
         # AGENTS.md has both (from DB)
         agents_content = agents_md.read_text()
         assert "FastAPI" in agents_content or "8787" in agents_content
+
+
+def test_sync_backend_uses_onnx_embedder(tmp_path):
+    """#1092: the sync subprocess must pick the torch-free ONNX embedder.
+
+    Defaulting to the LOCAL (sentence-transformers) embedder makes
+    `wrap --memory` crash with an ImportError on the proxy extras. The backend
+    must match the proxy MCP server, which uses ONNX.
+    """
+    backend = _build_sync_backend(str(tmp_path / "memory.db"))
+    assert backend._config.embedder_backend == "onnx"
+
+
+@pytest.mark.windows_newline
+class TestSyncNewlineContract:
+    """Sync adapters and sync state pin ``newline="\n"`` — see #3698.
+
+    AGENTS.md and the Claude memory files are also written by
+    ``headroom/learn/writer.py``, which pins LF. An unpinned write here flips
+    the same file back to CRLF on Windows on the next sync, so the two
+    subsystems fight over the line endings of a committed file.
+
+    Asserted at the call, not the artifact: ``TextIOWrapper`` picks its newline
+    translation target at C-compile time (``#ifdef MS_WINDOWS``), so on POSIX
+    an unpinned write looks identical on disk to a pinned one.
+    """
+
+    @pytest.mark.asyncio
+    async def test_adapter_and_state_writes_pin_lf(self, tmp_path, monkeypatch):
+        claude_dir = tmp_path / "claude"
+        claude_dir.mkdir()
+        (claude_dir / "MEMORY.md").write_text("# Memory\n\n## User\n- existing\n")
+        agents_md = tmp_path / "AGENTS.md"
+        agents_md.write_text("# Existing instructions\n")
+
+        calls: list[tuple[Path, str | None]] = []
+        original = Path.write_text
+
+        def spy(self, data, encoding=None, errors=None, newline=None):
+            calls.append((self, newline))
+            return original(self, data, encoding=encoding, errors=errors, newline=newline)
+
+        monkeypatch.setattr(Path, "write_text", spy)
+
+        await ClaudeCodeAdapter(claude_dir).write_memories(
+            [{"content": "Port 8787 is default", "id": "mem_0001"}]
+        )
+        await CodexAdapter(agents_md).write_memories([{"content": "Uses ruff for linting"}])
+        _save_sync_state(tmp_path / "state" / "sync_state.json", {"version": 1})
+
+        assert calls, "no writes captured — this test no longer drives the adapters"
+        unpinned = sorted(str(path) for path, newline in calls if newline != "\n")
+        assert not unpinned, f"sync writes without newline='\\n': {unpinned}"
+        assert {path.name for path, _ in calls} >= {
+            "MEMORY.md",  # claude_code._update_memory_md_index
+            "AGENTS.md",  # codex_agent.write_memories
+            "sync_state.json",  # sync._save_sync_state
+        }
+        assert any(name.startswith("headroom_") for name in {p.name for p, _ in calls})

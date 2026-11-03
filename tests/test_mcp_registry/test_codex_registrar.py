@@ -9,11 +9,16 @@ import pytest
 
 from headroom.mcp_registry.base import RegisterStatus, ServerSpec
 from headroom.mcp_registry.codex import CodexRegistrar
+from headroom.mcp_registry.install import build_headroom_spec
 
 if sys.version_info >= (3, 11):
     import tomllib
 else:  # pragma: no cover
     import tomli as tomllib
+
+
+_RESOLVED_COMMAND = ("/usr/bin/python", "-m", "headroom.cli")
+_RESOLVED_ARGS = ("-m", "headroom.cli", "mcp", "serve")
 
 
 def _make_registrar(tmp_path: Path) -> CodexRegistrar:
@@ -23,10 +28,18 @@ def _make_registrar(tmp_path: Path) -> CodexRegistrar:
 def _spec(env: dict[str, str] | None = None) -> ServerSpec:
     return ServerSpec(
         name="headroom",
-        command="headroom",
-        args=("mcp", "serve"),
+        command=_RESOLVED_COMMAND[0],
+        args=_RESOLVED_ARGS,
         env=env or {},
     )
+
+
+def _install_spec(monkeypatch: pytest.MonkeyPatch) -> ServerSpec:
+    monkeypatch.setattr(
+        "headroom.mcp_registry.install.resolve_headroom_command",
+        lambda: list(_RESOLVED_COMMAND),
+    )
+    return build_headroom_spec()
 
 
 def _serena_spec() -> ServerSpec:
@@ -111,16 +124,16 @@ def test_get_server_returns_spec_when_table_present(tmp_path: Path) -> None:
     cfg.parent.mkdir()
     cfg.write_text(
         "[mcp_servers.headroom]\n"
-        'command = "headroom"\n'
-        'args = ["mcp", "serve"]\n'
+        f"command = {_RESOLVED_COMMAND[0]!r}\n"
+        f"args = {list(_RESOLVED_ARGS)!r}\n"
         "\n"
         "[mcp_servers.headroom.env]\n"
         'HEADROOM_PROXY_URL = "http://127.0.0.1:9000"\n'
     )
     got = _make_registrar(tmp_path).get_server("headroom")
     assert got is not None
-    assert got.command == "headroom"
-    assert got.args == ("mcp", "serve")
+    assert got.command == _RESOLVED_COMMAND[0]
+    assert got.args == _RESOLVED_ARGS
     assert got.env == {"HEADROOM_PROXY_URL": "http://127.0.0.1:9000"}
 
 
@@ -131,14 +144,60 @@ def test_get_server_robust_to_unparseable_toml(tmp_path: Path) -> None:
     assert _make_registrar(tmp_path).get_server("headroom") is None
 
 
+def test_register_refuses_unparseable_config(tmp_path: Path) -> None:
+    """An unparseable config.toml must not be appended to (that would corrupt it
+    further); refuse and leave it byte-for-byte untouched."""
+    cfg = _config_path(tmp_path)
+    cfg.parent.mkdir()
+    original = "this = is = not = valid\n"
+    cfg.write_text(original)
+
+    result = _make_registrar(tmp_path).register_server(_spec())
+
+    assert result.status == RegisterStatus.FAILED
+    assert "not valid TOML" in result.detail
+    assert cfg.read_text() == original
+
+
+def test_register_refuses_non_table_mcp_servers_entry(tmp_path: Path) -> None:
+    """A valid config whose mcp_servers.headroom is a non-table must not get a
+    duplicate `[mcp_servers.headroom]` table appended (which tomllib rejects)."""
+    cfg = _config_path(tmp_path)
+    cfg.parent.mkdir()
+    original = '[mcp_servers]\nheadroom = "not-a-table"\n'
+    cfg.write_text(original)
+
+    result = _make_registrar(tmp_path).register_server(_spec())
+
+    assert result.status == RegisterStatus.FAILED
+    assert "non-table" in result.detail
+    # Untouched — still the original single (string) definition.
+    assert cfg.read_text() == original
+
+
+def test_register_refuses_non_table_mcp_servers(tmp_path: Path) -> None:
+    """A non-table top-level mcp_servers is also refused, not clobbered."""
+    cfg = _config_path(tmp_path)
+    cfg.parent.mkdir()
+    original = 'mcp_servers = "oops"\n'
+    cfg.write_text(original)
+
+    result = _make_registrar(tmp_path).register_server(_spec())
+
+    assert result.status == RegisterStatus.FAILED
+    assert cfg.read_text() == original
+
+
 # ----------------------------------------------------------------------
 # register_server() — happy paths
 # ----------------------------------------------------------------------
 
 
-def test_register_creates_config_when_missing(tmp_path: Path) -> None:
+def test_register_creates_config_when_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     reg = _make_registrar(tmp_path)
-    result = reg.register_server(_spec())
+    result = reg.register_server(_install_spec(monkeypatch))
     assert result.status == RegisterStatus.REGISTERED
     cfg = _config_path(tmp_path)
     assert cfg.exists()
@@ -146,8 +205,8 @@ def test_register_creates_config_when_missing(tmp_path: Path) -> None:
     assert "# --- Headroom MCP server ---" in text
     assert "[mcp_servers.headroom]" in text
     parsed = tomllib.loads(text)
-    assert parsed["mcp_servers"]["headroom"]["command"] == "headroom"
-    assert parsed["mcp_servers"]["headroom"]["args"] == ["mcp", "serve"]
+    assert parsed["mcp_servers"]["headroom"]["command"] == _RESOLVED_COMMAND[0]
+    assert parsed["mcp_servers"]["headroom"]["args"] == list(_RESOLVED_ARGS)
 
 
 def test_register_appends_to_existing_config_preserves_other_keys(tmp_path: Path) -> None:
@@ -166,7 +225,43 @@ def test_register_appends_to_existing_config_preserves_other_keys(tmp_path: Path
     parsed = tomllib.loads(text)
     assert parsed["model"] == "gpt-4o"
     assert parsed["other_section"]["value"] == 42
-    assert parsed["mcp_servers"]["headroom"]["command"] == "headroom"
+    assert parsed["mcp_servers"]["headroom"]["command"] == _RESOLVED_COMMAND[0]
+
+
+def test_evict_foreign_tables_ignores_header_text_inside_string() -> None:
+    # TOML allows U+2028 in a single-line string, so "[foreign]" here is part
+    # of the value, not a table header to move out of the span.
+    from headroom.mcp_registry.codex import _MARKER_END, _MARKER_START, _evict_foreign_tables
+
+    content = (
+        f"{_MARKER_START}\n"
+        "[mcp_servers.headroom]\n"
+        'note = "x [foreign] #"\n'
+        f"{_MARKER_END}\n"
+        'model = "gpt-5"\n'
+    )
+    assert _evict_foreign_tables(content, "headroom", _MARKER_START, _MARKER_END) == content
+
+
+def test_register_accepts_multiline_inline_table(tmp_path: Path) -> None:
+    # Codex accepts an inline table split across lines (#4378); registering must
+    # not refuse the file as invalid TOML, and the user's text must be kept as is.
+    cfg = _config_path(tmp_path)
+    cfg.parent.mkdir()
+    original = (
+        "[mcp_servers.dingtalk]\n"
+        'command = "npx"\n'
+        "env = {\n"
+        '  DINGTALK_Client_ID = "**********",\n'
+        "  \n"
+        "    }\n"
+    )
+    cfg.write_text(original)
+    result = _make_registrar(tmp_path).register_server(_spec())
+    assert result.status == RegisterStatus.REGISTERED, result.detail
+    text = cfg.read_text()
+    assert text.startswith(original)
+    assert "[mcp_servers.headroom]" in text
 
 
 def test_register_includes_env_subtable(tmp_path: Path) -> None:
@@ -193,7 +288,7 @@ def test_register_headroom_and_serena_coexist(tmp_path: Path) -> None:
     assert "# --- Headroom MCP server: serena ---" in text
 
     parsed = tomllib.loads(text)
-    assert parsed["mcp_servers"]["headroom"]["command"] == "headroom"
+    assert parsed["mcp_servers"]["headroom"]["command"] == _RESOLVED_COMMAND[0]
     assert parsed["mcp_servers"]["serena"]["command"] == "uvx"
 
 
@@ -326,11 +421,11 @@ def test_unregister_preserves_user_managed_entry(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "spec",
     [
-        ServerSpec(name="headroom", command="headroom", args=("mcp", "serve")),
+        ServerSpec(name="headroom", command=_RESOLVED_COMMAND[0], args=_RESOLVED_ARGS),
         ServerSpec(
             name="headroom",
-            command="headroom",
-            args=("mcp", "serve"),
+            command=_RESOLVED_COMMAND[0],
+            args=_RESOLVED_ARGS,
             env={"HEADROOM_PROXY_URL": "http://127.0.0.1:9000"},
         ),
         ServerSpec(name="headroom", command="/usr/bin/headroom", args=()),
@@ -344,3 +439,144 @@ def test_round_trip(tmp_path: Path, spec: ServerSpec) -> None:
     assert got.command == spec.command
     assert got.args == spec.args
     assert got.env == spec.env
+
+
+# ---------------------------------------------------------------------------
+# #733 — encoding / line-ending safety on GBK / CRLF Windows configs
+# ---------------------------------------------------------------------------
+
+
+def test_register_does_not_double_crlf(tmp_path: Path) -> None:
+    """A pre-existing CRLF config must not gain ``\\r\\r\\n`` after register."""
+    import tomllib
+
+    cfg = _config_path(tmp_path)
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_bytes(b'model = "gpt-5"\r\nworkers = 1\r\n')
+
+    result = _make_registrar(tmp_path).register_server(_spec())
+
+    assert result.status == RegisterStatus.REGISTERED
+    raw = cfg.read_bytes()
+    assert b"\r\r\n" not in raw
+    tomllib.loads(raw.decode("utf-8"))  # still valid TOML
+
+
+def test_register_preserves_non_ascii_values(tmp_path: Path) -> None:
+    """A config with non-ASCII (Chinese) values survives register and stays parseable."""
+    import tomllib
+
+    cfg = _config_path(tmp_path)
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text('model = "gpt-5"\nproject = "比赛/机器人"\n', encoding="utf-8")
+
+    result = _make_registrar(tmp_path).register_server(_spec())
+
+    assert result.status == RegisterStatus.REGISTERED
+    data = tomllib.loads(cfg.read_text(encoding="utf-8"))
+    assert data["project"] == "比赛/机器人"
+    assert "headroom" in data.get("mcp_servers", {})
+
+
+# ----------------------------------------------------------------------
+# Tables another app appended inside our marker span
+# ----------------------------------------------------------------------
+
+# The ChatGPT app's TOML writer appends its tables before the document's
+# trailing comment, which is our end marker when our span is last.
+_APP_TABLES = (
+    "\n[mcp_servers.node_repl]\n"
+    'command = "/Applications/ChatGPT.app/Contents/Resources/node_repl"\n'
+    "\n[mcp_servers.node_repl.env]\n"
+    'NODE_REPL_MODE = "browser"\n'
+)
+
+
+def _app_appends_inside_span(cfg: Path, tables: str = _APP_TABLES.lstrip("\n")) -> None:
+    end = "# --- end Headroom MCP server ---"
+    cfg.write_text(cfg.read_text().replace(end, tables + end))
+
+
+# A foreign multi-line string holding a line that reads as our header: the
+# line-level move splits the table wrongly, so the rewrite must be refused.
+_UNSPLITTABLE = '[notes]\ntext = """\n[mcp_servers.headroom.env]\n"""\n'
+
+
+def test_unregister_keeps_app_table_inside_span(tmp_path: Path) -> None:
+    reg = _make_registrar(tmp_path)
+    cfg = _config_path(tmp_path)
+    cfg.parent.mkdir()
+    cfg.write_text('model = "gpt-5"\n')
+    reg.register_server(_spec())
+    _app_appends_inside_span(cfg)
+
+    assert reg.unregister_server("headroom") is True
+
+    data = tomllib.loads(cfg.read_text())
+    assert "headroom" not in data["mcp_servers"]
+    assert data["mcp_servers"]["node_repl"]["env"] == {"NODE_REPL_MODE": "browser"}
+    assert data["model"] == "gpt-5"
+
+
+def test_register_force_keeps_app_table_inside_span(tmp_path: Path) -> None:
+    reg = _make_registrar(tmp_path)
+    cfg = _config_path(tmp_path)
+    reg.register_server(_spec(env={"HEADROOM_PROXY_URL": "http://127.0.0.1:9999"}))
+    _app_appends_inside_span(cfg)
+
+    assert reg.register_server(_spec(), force=True).status == RegisterStatus.REGISTERED
+
+    data = tomllib.loads(cfg.read_text())
+    assert data["mcp_servers"]["headroom"].get("env") is None
+    assert data["mcp_servers"]["node_repl"]["env"] == {"NODE_REPL_MODE": "browser"}
+    # The app's table now sits outside our span, so the next unregister keeps it too.
+    assert reg.unregister_server("headroom") is True
+    assert "node_repl" in tomllib.loads(cfg.read_text())["mcp_servers"]
+
+
+def test_unregister_keeps_quoted_key_table_inside_span(tmp_path: Path) -> None:
+    # The `#` in a quoted key is not a comment.
+    reg = _make_registrar(tmp_path)
+    cfg = _config_path(tmp_path)
+    reg.register_server(_spec())
+    _app_appends_inside_span(cfg, '[mcp_servers."foo#bar"]\ncommand = "foreign"\n')
+    assert set(tomllib.loads(cfg.read_text())["mcp_servers"]) == {"headroom", "foo#bar"}
+
+    assert reg.unregister_server("headroom") is True
+
+    assert tomllib.loads(cfg.read_text())["mcp_servers"] == {"foo#bar": {"command": "foreign"}}
+
+
+@pytest.mark.parametrize("inside_span", [_UNSPLITTABLE, "broken =\n"])
+def test_refuses_span_rewrite_that_would_change_other_entries(
+    tmp_path: Path, inside_span: str
+) -> None:
+    reg = _make_registrar(tmp_path)
+    cfg = _config_path(tmp_path)
+    reg.register_server(_spec(env={"HEADROOM_PROXY_URL": "http://127.0.0.1:9999"}))
+    _app_appends_inside_span(cfg, inside_span)
+    before = cfg.read_text()
+
+    assert reg.unregister_server("headroom") is False
+    assert reg.register_server(_spec(), force=True).status == RegisterStatus.FAILED
+    assert cfg.read_text() == before
+
+
+def test_register_escapes_control_chars_in_env_value(tmp_path: Path) -> None:
+    """A newline in an env value must be escaped so the block stays valid TOML.
+
+    TOML basic strings forbid literal control characters other than tab, so a
+    multi-line value (e.g. a PEM key in an env var) rendered with only ``\\``
+    and ``"`` escaping produced unparseable TOML. The write guard then rejected
+    the whole registration with a misleading "file does not parse" error.
+    """
+    reg = _make_registrar(tmp_path)
+    pem = "-----BEGIN KEY-----\nabc\n-----END KEY-----"
+
+    result = reg.register_server(_spec(env={"PEM": pem}), force=True)
+
+    assert result.status == RegisterStatus.REGISTERED
+    # The rendered config parses and round-trips the value verbatim.
+    parsed = tomllib.loads(_config_path(tmp_path).read_text())
+    assert parsed["mcp_servers"]["headroom"]["env"]["PEM"] == pem
+    assert reg.get_server("headroom").env["PEM"] == pem

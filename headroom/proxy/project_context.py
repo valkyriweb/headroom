@@ -11,30 +11,37 @@ savings to a project without threading a parameter through every handler.
 The value is sanitized (printable characters only, length-capped) before it
 is stored; an absent or unusable header simply leaves attribution off for
 that request, matching pre-feature behavior.
+
+A second contextvar, ``_current_registered_cwd``, is what disk verification
+trusts as a workspace root. It is never a raw header value — it's the
+result of ``workspace_registry.resolve_registered_cwd()``, which matches a
+session token against a workspace root ``headroom wrap`` itself registered
+over a trusted local channel (a 0700 marker file). A request can only
+*reference* a pre-established root this way, never assert an arbitrary one.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, MutableMapping
+from collections.abc import MutableMapping
 from contextvars import ContextVar
 from typing import Any
-from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
+from headroom.proxy.project_policy import (
+    PROJECT_HEADER,
+    PROJECT_PATH_PREFIX,
+    classify_project,
+    split_project_path,
+    with_project_prefix,
+)
+from headroom.proxy.request_scope import normalize_scope_path
 from headroom.proxy.savings_tracker import sanitize_project_name
-
-PROJECT_HEADER = "x-headroom-project"
-PROJECT_PATH_PREFIX = "/p/"
 
 _current_project: ContextVar[str | None] = ContextVar("headroom_current_project", default=None)
 
-
-def classify_project(headers: Mapping[str, Any] | Any) -> str | None:
-    """Extract a sanitized project name from request headers, if present."""
-    get = getattr(headers, "get", None)
-    if get is None:
-        return None
-    value = get(PROJECT_HEADER) or get("X-Headroom-Project")
-    return sanitize_project_name(value)
+# Server-verified, not header-derived -- see module docstring.
+_current_registered_cwd: ContextVar[str | None] = ContextVar(
+    "headroom_current_registered_cwd", default=None
+)
 
 
 def set_current_project(project: str | None) -> None:
@@ -47,22 +54,14 @@ def get_current_project() -> str | None:
     return _current_project.get()
 
 
-def split_project_path(path: str) -> tuple[str | None, str]:
-    """Split ``/p/<name>/rest`` into ``(name, /rest)``.
+def set_registered_cwd(cwd: str | None) -> None:
+    """Bind the server-verified workspace root resolved for this request."""
+    _current_registered_cwd.set(cwd)
 
-    Clients that cannot send custom headers (aider, Copilot BYOK, Cursor)
-    are pointed at a project-prefixed base URL instead; the first path
-    segment after ``/p/`` is the URL-encoded project name. Returns
-    ``(None, path)`` unchanged when the prefix is absent or unusable.
-    """
-    if not path.startswith(PROJECT_PATH_PREFIX):
-        return None, path
-    remainder = path[len(PROJECT_PATH_PREFIX) :]
-    segment, sep, rest = remainder.partition("/")
-    project = sanitize_project_name(unquote(segment)) if segment else None
-    if project is None:
-        return None, path
-    return project, ("/" + rest) if sep else "/"
+
+def get_registered_cwd() -> str | None:
+    """Server-verified workspace root for the current request, or ``None``."""
+    return _current_registered_cwd.get()
 
 
 def strip_project_path_prefix(scope: MutableMapping[str, Any]) -> str | None:
@@ -73,25 +72,8 @@ def strip_project_path_prefix(scope: MutableMapping[str, Any]) -> str | None:
     """
     project, stripped = split_project_path(scope.get("path", ""))
     if project is not None:
-        scope["path"] = stripped
-        if "raw_path" in scope:
-            scope["raw_path"] = quote(stripped).encode("ascii")
+        normalize_scope_path(scope, stripped)
     return project
-
-
-def with_project_prefix(base_url: str, project: str | None) -> str:
-    """Insert ``/p/<name>`` ahead of the path of a local proxy base URL.
-
-    Producer-side counterpart of :func:`split_project_path`, used by
-    ``headroom wrap`` for clients that cannot send custom headers.
-    Returns ``base_url`` unchanged when the project name is unusable.
-    """
-    name = sanitize_project_name(project)
-    if name is None:
-        return base_url
-    parts = urlsplit(base_url)
-    prefixed = f"{PROJECT_PATH_PREFIX}{quote(name, safe='')}{parts.path}"
-    return urlunsplit(parts._replace(path=prefixed.rstrip("/")))
 
 
 __all__ = [
@@ -99,7 +81,9 @@ __all__ = [
     "PROJECT_PATH_PREFIX",
     "classify_project",
     "get_current_project",
+    "get_registered_cwd",
     "set_current_project",
+    "set_registered_cwd",
     "split_project_path",
     "strip_project_path_prefix",
     "with_project_prefix",

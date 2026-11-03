@@ -168,7 +168,9 @@ def test_content_router_protects_instruction_roles_but_compresses_tool_outputs()
     def fake_compress(text: str, **kwargs: Any) -> SimpleNamespace:
         calls.append(text)
         return SimpleNamespace(
-            compressed="COMPRESSED",
+            # CCR marker -> recoverable, so the #1307 gate keeps this lossy tool
+            # compression (tool output still compresses *because* it can be retrieved).
+            compressed="COMPRESSED <<ccr:tool>>",
             compression_ratio=0.1,
             strategy_used=CompressionStrategy.KOMPRESS,
         )
@@ -187,7 +189,7 @@ def test_content_router_protects_instruction_roles_but_compresses_tool_outputs()
     assert result.messages[0]["content"] == messages[0]["content"]
     assert result.messages[1]["content"] == messages[1]["content"]
     assert result.messages[2]["content"] == messages[2]["content"]
-    assert result.messages[3]["content"] == "COMPRESSED"
+    assert result.messages[3]["content"] == "COMPRESSED <<ccr:tool>>"
     assert calls == [tool_text]
 
 
@@ -244,7 +246,10 @@ def test_discover_pipeline_extensions_handles_load_and_init_failures(monkeypatch
         lambda group: entries if group == pipeline_module.ENTRY_POINT_GROUP else [],
     )
 
-    discovered = pipeline_module.discover_pipeline_extensions()
+    # Discovery is opt-in since the contract gained ``body`` (it can now
+    # rewrite max_tokens/effort on live traffic), so name them explicitly.
+    # The isolation behaviour under test is unchanged.
+    discovered = pipeline_module.discover_pipeline_extensions(["*"])
 
     assert len(discovered) == 2
     assert hasattr(discovered[0], "on_pipeline_event")

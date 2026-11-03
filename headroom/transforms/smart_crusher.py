@@ -46,13 +46,18 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
-from ..config import CCRConfig, TransformResult
+from ..ccr.tool_injection import CCR_TOOL_NAME
+from ..config import CCRConfig, TransformResult, is_tool_excluded, unwrap_tool_call_name
+from ..log_safety import describe_exception, safe_id
 from ..tokenizer import Tokenizer
 from ..utils import compute_short_hash, create_tool_digest_marker, deep_copy_messages
 from .base import Transform
+from .content_detector import normalize_concatenated_json
 
 logger = logging.getLogger(__name__)
 
@@ -75,18 +80,43 @@ _SUPPORTED_COMPACTION_FORMATS = ("csv-schema", "json", "markdown-kv")
 CCR_SENTINEL_KEY = "_ccr_dropped"
 
 
+# Prefix/infix identifying the scalar-array drop sentinel emitted by the
+# Rust crusher when string/number/mixed array items are dropped with
+# `enable_ccr_marker` on (headroomlabs-ai/headroom#3650). Unlike the
+# dict sentinel object above, this one is a plain string so string
+# arrays keep a uniform element type.
+SCALAR_SENTINEL_PREFIX = "… "
+SCALAR_SENTINEL_INFIX = " more items "
+
+
 def is_ccr_sentinel(item: Any) -> bool:
-    """True if `item` is a CCR-dropped sentinel object."""
-    return isinstance(item, dict) and CCR_SENTINEL_KEY in item
+    """True if `item` is a CCR-dropped sentinel.
+
+    Covers both sentinel shapes: the dict object (``{"_ccr_dropped": ...}``)
+    emitted for dict arrays, and the plain-string sentinel
+    (``"… N more items <<ccr:HASH N_items_offloaded>>"``) appended to
+    string/number/mixed arrays when items are dropped
+    (headroomlabs-ai/headroom#3650).
+    """
+    if isinstance(item, dict):
+        return CCR_SENTINEL_KEY in item
+    return (
+        isinstance(item, str)
+        and item.startswith(SCALAR_SENTINEL_PREFIX)
+        and SCALAR_SENTINEL_INFIX in item
+        and "<<ccr:" in item
+    )
 
 
 def strip_ccr_sentinels(items: Any) -> Any:
     """Return `items` with any CCR-dropped sentinel objects filtered out.
 
     Pass this through any iteration over a compressed array's contents
-    when your code expects a uniform-schema list of records. The sentinel
-    carries a `<<ccr:HASH ...>>` marker for the LLM and shouldn't be
-    confused for a record — it has only the `_ccr_dropped` key.
+    when your code expects a uniform-schema list of records. The dict
+    sentinel carries a `<<ccr:HASH ...>>` marker for the LLM and shouldn't
+    be confused for a record — it has only the `_ccr_dropped` key. The
+    string sentinel (scalar arrays) likewise marks dropped items without
+    pretending to be data.
 
     Non-list inputs pass through unchanged so callers can wrap whatever
     `json.loads` returned without first checking the shape.
@@ -100,7 +130,7 @@ def strip_ccr_sentinels(items: Any) -> Any:
 
 
 def _build_tool_name_index(messages: list[dict[str, Any]]) -> dict[str, str]:
-    """Map tool_call_id/tool_use_id → tool name across OpenAI + Anthropic formats.
+    """Map tool_call_id/tool_use_id → effective tool name in both wire formats.
 
     Skips entries where id or name is missing; those calls still crush, but
     won't contribute a tool-name to the ``smart_crush`` tag.
@@ -111,9 +141,10 @@ def _build_tool_name_index(messages: list[dict[str, Any]]) -> dict[str, str]:
             continue
         for tc in msg.get("tool_calls") or []:
             tc_id = tc.get("id")
-            name = (tc.get("function") or {}).get("name")
-            if tc_id and name:
-                index[tc_id] = name
+            function = tc.get("function") or {}
+            name = function.get("name")
+            if tc_id and isinstance(name, str) and name:
+                index[tc_id] = unwrap_tool_call_name(name, function.get("arguments"))
         content = msg.get("content")
         if isinstance(content, list):
             for block in content:
@@ -121,8 +152,8 @@ def _build_tool_name_index(messages: list[dict[str, Any]]) -> dict[str, str]:
                     continue
                 bid = block.get("id")
                 name = block.get("name")
-                if bid and name:
-                    index[bid] = name
+                if bid and isinstance(name, str) and name:
+                    index[bid] = unwrap_tool_call_name(name, block.get("input"))
     return index
 
 
@@ -187,6 +218,13 @@ class SmartCrusherConfig:
     # and KV experiments — KV repeats field names per row, so it clears
     # the gate less often than CSV.
     lossless_min_savings_ratio: float = 0.15
+    # Strict lossless mode. When True, lossless tabular compaction still
+    # applies, but any path that would otherwise emit a CCR marker — the
+    # lossy row-drop sentinel AND opaque-blob offload — leaves the content
+    # uncompacted instead. The output is always marker-free and fully
+    # byte-recoverable: rows are never dropped and opaque cells render
+    # inline. Default False (markers allowed). Mirrors the Rust default.
+    lossless_only: bool = False
 
     # Compaction heuristics (mirror Rust CompactConfig; see
     # crates/headroom-core/src/transforms/smart_crusher/compaction/compactor.rs).
@@ -200,6 +238,29 @@ class SmartCrusherConfig:
     # Bucket-count bounds for discriminator usefulness.
     compaction_min_buckets: int = 2
     compaction_max_buckets: int = 8
+
+    # ─── Audit-safe mode (#1705) ───────────────────────────────────────
+    # Opt-in. `crush_array_json`'s row selection (Rust-side statistical
+    # sampling) has no concept of "this row must not disappear from the
+    # prompt" — a rare compliance/audit-trail row can be sampled out or
+    # replaced by a `<<ccr:...>>` retrieval marker like any other row.
+    # When `audit_safe=True` and `protected_patterns` is non-empty,
+    # `crush_array_json` scans rows for pattern matches before
+    # compression, then guarantees matched rows survive in the
+    # compressed output verbatim — not dropped, not marker-only. This
+    # field never reaches the Rust config (`_rust_cfg_kwargs` excludes
+    # it); it's pure Python post-processing around the Rust call.
+    audit_safe: bool = False
+    # Strings or regexes. A row is "protected" if any pattern matches
+    # its canonical JSON text (`json.dumps(row, sort_keys=True)`).
+    protected_patterns: list[str] | None = None
+    # If protected rows still can't be fully preserved after the
+    # splice-back pass (defensive — should only trip on internal
+    # bugs), fail closed by returning the original, uncompressed array
+    # instead of a result with fewer protected-row matches than the
+    # input had. When False, ship the best-effort result with a
+    # logged warning instead of refusing to compress.
+    fail_closed_on_protected_loss: bool = True
 
 
 # ─── Rust-backed SmartCrusher ─────────────────────────────────────────────
@@ -227,6 +288,7 @@ class SmartCrusher(Transform):
         with_compaction: bool = True,
         observer: Any = None,
         compaction_format: str | None = None,
+        lossless_only: bool | None = None,
     ):
         # Hard import — no Python fallback. If the wheel is missing the
         # caller must build it (scripts/build_rust_extension.sh) or
@@ -242,6 +304,28 @@ class SmartCrusher(Transform):
         cfg = config or SmartCrusherConfig()
         self.config = cfg
         self._with_compaction = with_compaction
+
+        # Audit-safe mode (#1705). getattr fallbacks: callers may pass
+        # the SDK-side `headroom.config.SmartCrusherConfig`, which
+        # doesn't carry these fields — defaults to disabled, the safe
+        # choice (no behavior change for callers who don't opt in).
+        self._audit_safe = bool(getattr(cfg, "audit_safe", False))
+        self._fail_closed_on_protected_loss = bool(
+            getattr(cfg, "fail_closed_on_protected_loss", True)
+        )
+        self._protected_patterns = self._compile_protected_patterns(
+            getattr(cfg, "protected_patterns", None)
+        )
+        # Strict lossless mode. An explicit `lossless_only=` kwarg wins
+        # over the config field, so callers can flip it without rebuilding
+        # a whole config. `crush(..., lossless_only=...)` overrides again
+        # per call. getattr fallback: callers may pass the SDK-side
+        # `headroom.config.SmartCrusherConfig`, which also carries it.
+        self._lossless_only = (
+            bool(getattr(cfg, "lossless_only", False))
+            if lossless_only is None
+            else bool(lossless_only)
+        )
         # `observer`: see `headroom.transforms.observability`. The
         # legacy proxy pipeline uses SmartCrusher.apply() directly
         # (no ContentRouter); without an observer here, those
@@ -315,39 +399,46 @@ class SmartCrusher(Transform):
         # Build the Rust crusher with every field from the Python
         # config, plus the relevance_threshold default (0.3) — the
         # Python dataclass doesn't carry that field; it lives on
-        # `RelevanceScorerConfig` instead.
-        rust_cfg = _RustSmartCrusherConfig(
-            enabled=cfg.enabled,
-            min_items_to_analyze=cfg.min_items_to_analyze,
-            min_tokens_to_crush=cfg.min_tokens_to_crush,
-            variance_threshold=cfg.variance_threshold,
-            uniqueness_threshold=cfg.uniqueness_threshold,
-            similarity_threshold=cfg.similarity_threshold,
-            max_items_after_crush=cfg.max_items_after_crush,
-            preserve_change_points=cfg.preserve_change_points,
-            factor_out_constants=cfg.factor_out_constants,
-            include_summaries=cfg.include_summaries,
-            use_feedback_hints=cfg.use_feedback_hints,
-            toin_confidence_threshold=cfg.toin_confidence_threshold,
-            dedup_identical_items=cfg.dedup_identical_items,
-            first_fraction=cfg.first_fraction,
-            last_fraction=cfg.last_fraction,
-            relevance_threshold=0.3,
-            enable_ccr_marker=(
+        # `RelevanceScorerConfig` instead. Kept as a kwargs dict so the
+        # per-call `crush(..., lossless_only=...)` override can rebuild an
+        # alternate crusher with just that one field flipped.
+        self._RustSmartCrusher = _RustSmartCrusher
+        self._RustSmartCrusherConfig = _RustSmartCrusherConfig
+        self._rust_cfg_kwargs = {
+            "enabled": cfg.enabled,
+            "min_items_to_analyze": cfg.min_items_to_analyze,
+            "min_tokens_to_crush": cfg.min_tokens_to_crush,
+            "variance_threshold": cfg.variance_threshold,
+            "uniqueness_threshold": cfg.uniqueness_threshold,
+            "similarity_threshold": cfg.similarity_threshold,
+            "max_items_after_crush": cfg.max_items_after_crush,
+            "preserve_change_points": cfg.preserve_change_points,
+            "factor_out_constants": cfg.factor_out_constants,
+            "include_summaries": cfg.include_summaries,
+            "use_feedback_hints": cfg.use_feedback_hints,
+            "toin_confidence_threshold": cfg.toin_confidence_threshold,
+            "dedup_identical_items": cfg.dedup_identical_items,
+            "first_fraction": cfg.first_fraction,
+            "last_fraction": cfg.last_fraction,
+            "relevance_threshold": 0.3,
+            "enable_ccr_marker": (
                 self._ccr_config.enabled and self._ccr_config.inject_retrieval_marker
             ),
+            "lossless_only": self._lossless_only,
             # getattr fallbacks: callers may pass the structurally-similar
             # `headroom.config.SmartCrusherConfig` (MCP server, SDK) or a
             # pre-existing config object that predates these fields.
-            lossless_min_savings_ratio=getattr(cfg, "lossless_min_savings_ratio", 0.15),
-            compaction_core_field_fraction=getattr(cfg, "compaction_core_field_fraction", 0.8),
-            compaction_heterogeneous_core_ratio=getattr(
+            "lossless_min_savings_ratio": getattr(cfg, "lossless_min_savings_ratio", 0.15),
+            "compaction_core_field_fraction": getattr(cfg, "compaction_core_field_fraction", 0.8),
+            "compaction_heterogeneous_core_ratio": getattr(
                 cfg, "compaction_heterogeneous_core_ratio", 0.6
             ),
-            compaction_max_flatten_inner_keys=getattr(cfg, "compaction_max_flatten_inner_keys", 6),
-            compaction_min_buckets=getattr(cfg, "compaction_min_buckets", 2),
-            compaction_max_buckets=getattr(cfg, "compaction_max_buckets", 8),
-        )
+            "compaction_max_flatten_inner_keys": getattr(
+                cfg, "compaction_max_flatten_inner_keys", 6
+            ),
+            "compaction_min_buckets": getattr(cfg, "compaction_min_buckets", 2),
+            "compaction_max_buckets": getattr(cfg, "compaction_max_buckets", 8),
+        }
         # Default: lossless-first compaction (PR4). Lossless wins for
         # cleanly tabular input where it saves ≥ 30% bytes; otherwise
         # falls through to the lossy path with CCR-Dropped retrieval
@@ -373,24 +464,85 @@ class SmartCrusher(Transform):
                 f"expected one of: {', '.join(_SUPPORTED_COMPACTION_FORMATS)}"
             )
         self._compaction_format = resolved_format if with_compaction else None
-        if not with_compaction:
-            self._rust = _RustSmartCrusher.without_compaction(rust_cfg)
-        elif resolved_format == "csv-schema":
-            # Keep the `new()` constructor for the default path so its
-            # byte-parity coverage stays on the exact production
-            # codepath.
-            self._rust = _RustSmartCrusher(rust_cfg)
-        else:
-            self._rust = _RustSmartCrusher.with_compaction_format(rust_cfg, resolved_format)
+        self._resolved_compaction_format = resolved_format
+        # Cache of Rust crushers keyed by lossless_only, so a per-call
+        # override builds the alternate at most once.
+        self._rust_by_lossless_only: dict[bool, Any] = {}
+        self._rust = self._build_rust(self._lossless_only)
 
-    def crush(self, content: str, query: str = "", bias: float = 1.0) -> CrushResult:
+    def _build_rust(self, lossless_only: bool) -> Any:
+        """Build (and cache) the Rust crusher for a `lossless_only` value."""
+        cached = self._rust_by_lossless_only.get(lossless_only)
+        if cached is not None:
+            return cached
+        kwargs = dict(self._rust_cfg_kwargs)
+        kwargs["lossless_only"] = lossless_only
+        rust_cfg = self._RustSmartCrusherConfig(**kwargs)
+        if not self._with_compaction:
+            rust = self._RustSmartCrusher.without_compaction(rust_cfg)
+        elif self._resolved_compaction_format == "csv-schema":
+            # Keep the `new()` constructor for the default path so its
+            # byte-parity coverage stays on the exact production codepath.
+            rust = self._RustSmartCrusher(rust_cfg)
+        else:
+            rust = self._RustSmartCrusher.with_compaction_format(
+                rust_cfg, self._resolved_compaction_format
+            )
+        self._rust_by_lossless_only[lossless_only] = rust
+        return rust
+
+    def crush(
+        self,
+        content: str,
+        query: str = "",
+        bias: float = 1.0,
+        lossless_only: bool | None = None,
+        record_toin: bool = True,
+    ) -> CrushResult:
         """Crush a single JSON content string.
 
         Mirrors the retired Python method. Returns a `CrushResult`
         dataclass so call sites that destructure with `asdict()` keep
         working.
+
+        `lossless_only` overrides the configured strict-lossless mode for
+        this call only. When `True`, the output is guaranteed marker-free
+        and byte-recoverable: lossless tabular compaction still applies,
+        but any path that would need a CCR marker (row-drop or
+        opaque-blob offload) leaves the content uncompacted instead.
+        `None` (default) uses the instance's configured value.
+
+        `record_toin=False` skips the TOIN write for this call only. The
+        ContentRouter passes it when the request's ``CompressionPolicy``
+        has ``toin_read_only=True`` (Subscription, F2.2): the crusher is
+        shared across concurrent requests, so the gate has to travel with
+        the call rather than through ``_runtime_compression_policy``.
         """
-        r = self._rust.crush(content, query, bias)
+        # Web search tools often return space-separated JSON objects
+        # (``{...} {...} {...}``) rather than a real array. The Rust crusher
+        # only compresses JSON arrays, so normalize that shape first —
+        # otherwise it passes through at 0% compression (#1741).
+        given = content
+        normalized = normalize_concatenated_json(content)
+        if normalized is not None:
+            content = normalized
+        rust = (
+            self._rust
+            if lossless_only is None or bool(lossless_only) == self._lossless_only
+            else self._build_rust(bool(lossless_only))
+        )
+        r = rust.crush(content, query, bias)
+        # Bridge any CCR markers emitted by the Rust crusher into the
+        # Python compression_store so /v1/retrieve resolves them; a marker
+        # the store did not take points nowhere, so keep the input instead.
+        # See `_mirror_ccr_to_python_store` for full rationale.
+        if not self._mirror_ccr_to_python_store(
+            rendered=r.compressed,
+            strategy=r.strategy,
+            query_context=query,
+            tool_name=None,
+        ):
+            return CrushResult(compressed=given, original=given, was_modified=False)
         # Re-attach the TOIN learning loop. The retired Python class
         # recorded compressions into TOIN inline; the Rust port doesn't
         # know about TOIN, and `ContentRouter._record_to_toin` skips
@@ -403,7 +555,7 @@ class SmartCrusher(Transform):
         # JSON re-canonicalization (whitespace normalization) without
         # actually compressing — the strategy stays `"passthrough"` in
         # that case, and there's no learning value in recording it.
-        if r.was_modified and r.strategy != "passthrough":
+        if record_toin and r.was_modified and r.strategy != "passthrough":
             self._record_to_toin(
                 original=content,
                 compressed=r.compressed,
@@ -411,21 +563,216 @@ class SmartCrusher(Transform):
                 query_context=query,
                 tool_name=None,
             )
-        # Bridge any CCR markers emitted by the Rust crusher into the
-        # Python compression_store so /v1/retrieve resolves them.
-        # See `_mirror_ccr_to_python_store` for full rationale.
-        self._mirror_ccr_to_python_store(
-            rendered=r.compressed,
-            strategy=r.strategy,
-            query_context=query,
-            tool_name=None,
-        )
         return CrushResult(
             compressed=r.compressed,
             original=r.original,
             was_modified=r.was_modified,
             strategy=r.strategy,
         )
+
+    # ─── Audit-safe protection (#1705) ─────────────────────────────────
+    #
+    # `crush_array_json`'s Rust-side row selection is purely statistical
+    # (variance, anomaly, position) — it has no notion of "this row is
+    # legally/compliance-significant and must stay visible in the
+    # prompt." Audit-safe mode bolts that on in Python: scan for
+    # pattern matches before compression, then guarantee matched rows
+    # survive the compressed output (never dropped, never marker-only).
+
+    @staticmethod
+    def _compile_protected_patterns(patterns: list[str] | None) -> list[re.Pattern[str]]:
+        """Compile `protected_patterns` once at construction time.
+
+        A pattern that fails to compile is a caller bug, not something
+        to swallow — silently treating an invalid regex as "no rows
+        protected" would defeat the entire point of audit-safe mode
+        (rows the caller believes are protected wouldn't be).
+        """
+        if not patterns:
+            return []
+        compiled = []
+        for p in patterns:
+            try:
+                compiled.append(re.compile(p))
+            except re.error as e:
+                raise ValueError(
+                    f"SmartCrusher: invalid protected_patterns regex {p!r}: {e}"
+                ) from e
+        return compiled
+
+    @staticmethod
+    def _canon(item: Any) -> str:
+        """Canonical JSON text for a row.
+
+        Used both for protected-pattern matching and for identity
+        comparison across the crush boundary — kept rows are
+        re-serialized by Rust, so rows are matched by content, not by
+        Python object identity. ``ensure_ascii=False`` so a pattern such
+        as ``Kraków`` sees the characters, not ``\\u00f3`` escapes.
+        """
+        return json.dumps(item, sort_keys=True, default=str, ensure_ascii=False)
+
+    def _row_matches_protected(self, item: Any) -> bool:
+        text = self._canon(item)
+        return any(p.search(text) for p in self._protected_patterns)
+
+    def _scan_protected_rows(self, items_json_or_content: str) -> list[Any]:
+        """Rows matching any `protected_patterns` entry, or `[]` when
+        audit-safe mode is off, no patterns are configured, or the
+        input doesn't parse as a JSON array (nothing row-shaped to
+        protect — e.g. raw CSV/log text, out of scope for this mode)."""
+        if not (self._audit_safe and self._protected_patterns):
+            return []
+        try:
+            parsed = json.loads(items_json_or_content)
+        except (json.JSONDecodeError, ValueError):
+            return []
+        if not isinstance(parsed, list):
+            return []
+        return [item for item in parsed if self._row_matches_protected(item)]
+
+    def _splice_missing_protected(
+        self, protected: list[Any], kept: list[Any]
+    ) -> tuple[list[Any], int]:
+        """Append any `protected` row missing from `kept` (identity by
+        canonical JSON, multiplicity-aware via `Counter` so duplicate
+        protected rows are each accounted for individually).
+
+        Returns `(kept_with_splice, lost_count)`. `lost_count` is
+        almost always 0 after splicing — it stays non-zero only when
+        something structural prevents the appended row from being
+        recognized as a survivor (defensive; see call sites).
+        """
+        available = Counter(self._canon(item) for item in kept)
+        missing = []
+        for item in protected:
+            key = self._canon(item)
+            if available[key] > 0:
+                available[key] -= 1
+            else:
+                missing.append(item)
+
+        if missing:
+            kept = kept + missing
+
+        surviving = Counter(self._canon(item) for item in kept)
+        needed = Counter(self._canon(item) for item in protected)
+        lost = sum(max(0, count - surviving[key]) for key, count in needed.items())
+        return kept, lost
+
+    def _apply_audit_safe_protection(
+        self,
+        protected: list[Any],
+        original_items_json: str,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Guarantee every row in `protected` survives in `result["items"]`.
+
+        Two phases:
+        1. Splice — any protected row missing from the compressed
+           output (statistically sampled out, or moved behind an
+           opaque `<<ccr:...>>` retrieval marker) is appended back
+           into `items` verbatim.
+        2. Verify — re-count protected-row survivors after splicing.
+           If the count is still short (defensive: should only trip
+           on an internal bug, e.g. the lossless table path rendering
+           rows into a non-addressable CSV blob), fail closed by
+           returning the original uncompressed array, or ship the
+           spliced result with a logged warning, per
+           `fail_closed_on_protected_loss`.
+        """
+        kept_json = result.get("items")
+        try:
+            kept = json.loads(kept_json) if isinstance(kept_json, str) else list(kept_json or [])
+        except (json.JSONDecodeError, ValueError):
+            kept = []
+
+        before_count = len(kept)
+        kept, lost = self._splice_missing_protected(protected, kept)
+        if len(kept) != before_count:
+            # Only reserialize when something was actually spliced in —
+            # an unmodified `kept` stays byte-identical to Rust's output.
+            # ensure_ascii=False matches serde_json (which never escapes
+            # non-ASCII), so a splice doesn't turn readable unicode into
+            # model-visible \uXXXX soup.
+            result = dict(result)
+            result["items"] = json.dumps(kept, ensure_ascii=False)
+        if not lost:
+            return result
+
+        msg = (
+            f"SmartCrusher audit_safe: {lost} protected row(s) could not be "
+            f"preserved through compression (pattern match count decreased "
+            f"even after splicing back missing rows)."
+        )
+        if self._fail_closed_on_protected_loss:
+            logger.warning("%s Failing closed: returning original uncompressed.", msg)
+            return {
+                "items": original_items_json,
+                "ccr_hash": None,
+                "dropped_summary": "",
+                "strategy_info": "audit_safe:fail_closed",
+                "compacted": None,
+                "compaction_kind": None,
+            }
+        logger.warning(
+            "%s fail_closed_on_protected_loss=False — shipping best-effort result.",
+            msg,
+        )
+        return result
+
+    def _apply_audit_safe_protection_to_content(
+        self,
+        protected: list[Any],
+        original_content: str,
+        crushed: str,
+        was_modified: bool,
+        info: str,
+    ) -> tuple[str, bool, str]:
+        """Guarantee protected rows survive `_smart_crush_content`'s
+        output — the tuple-shaped API `apply()` uses for real
+        tool-output compression (`crush_array_json` is the dict-shaped
+        API used by direct/test callers and the CCR retrieval flow;
+        `apply()` never calls it).
+
+        `crushed` may be a JSON array string (the common shape for the
+        lossy row-drop and passthrough paths) — spliced exactly like
+        `crush_array_json`. Anything else (lossless CSV/table
+        rendering, an opaque marker string) has no row structure left
+        to splice into, so verification falls back to counting
+        protected-pattern matches in the raw text before vs. after.
+        """
+        try:
+            parsed = json.loads(crushed)
+        except (json.JSONDecodeError, ValueError):
+            parsed = None
+
+        if isinstance(parsed, list):
+            kept, lost = self._splice_missing_protected(protected, parsed)
+            # Only reserialize when something was actually spliced in —
+            # see the matching comment in `_apply_audit_safe_protection`.
+            candidate = (
+                json.dumps(kept, ensure_ascii=False) if len(kept) != len(parsed) else crushed
+            )
+        else:
+            lost = sum(
+                max(0, len(p.findall(original_content)) - len(p.findall(crushed)))
+                for p in self._protected_patterns
+            )
+            candidate = crushed
+
+        if not lost:
+            return candidate, was_modified, info
+
+        msg = f"SmartCrusher audit_safe: {lost} protected pattern match(es) lost in compression."
+        if self._fail_closed_on_protected_loss:
+            logger.warning("%s Failing closed: returning original content uncompressed.", msg)
+            return original_content, False, "audit_safe:fail_closed"
+        logger.warning(
+            "%s fail_closed_on_protected_loss=False — shipping best-effort result.",
+            msg,
+        )
+        return candidate, was_modified, info
 
     def crush_array_json(
         self,
@@ -442,15 +789,26 @@ class SmartCrusher(Transform):
 
         Used by tests and by the proxy's CCR retrieval flow when it needs
         the hash directly rather than parsing it out of a prompt marker.
+
+        When this instance is configured with `audit_safe=True` and a
+        non-empty `protected_patterns`, rows matching any pattern are
+        scanned *before* compression and guaranteed to survive in the
+        returned `items` — see `_apply_audit_safe_protection`.
         """
+        protected = self._scan_protected_rows(items_json)
+
         result: dict[str, Any] = self._rust.crush_array_json(items_json, query, bias)
+
+        if protected:
+            result = self._apply_audit_safe_protection(protected, items_json, result)
         # Row-drop case: Rust returns the structured `ccr_hash` and has
         # already stashed the canonical in its own store. Mirror that
         # entry into the Python compression_store keyed by the same
         # 12-char SHA-256 hash so /v1/retrieve resolves it.
+        mirrored = True
         ccr_hash = result.get("ccr_hash")
         if ccr_hash:
-            self._mirror_single_hash_to_python_store(
+            mirrored = self._mirror_single_hash_to_python_store(
                 ccr_hash,
                 strategy=str(result.get("strategy_info") or "smart_crusher_row_drop"),
                 query_context=query,
@@ -458,22 +816,20 @@ class SmartCrusher(Transform):
             )
         # Opaque-blob substitutions inside the kept items also produce
         # markers. Walk the rendered shape to bridge those too.
-        kept_json = result.get("items")
-        if isinstance(kept_json, str) and "<<ccr:" in kept_json:
-            self._mirror_ccr_markers_in_text(
-                kept_json,
-                strategy=str(result.get("strategy_info") or "smart_crusher"),
-                query_context=query,
-                tool_name=None,
-            )
-        compacted = result.get("compacted")
-        if isinstance(compacted, str) and "<<ccr:" in compacted:
-            self._mirror_ccr_markers_in_text(
-                compacted,
-                strategy=str(result.get("strategy_info") or "smart_crusher"),
-                query_context=query,
-                tool_name=None,
-            )
+        strategy = str(result.get("strategy_info") or "smart_crusher")
+        for rendered in (result.get("items"), result.get("compacted")):
+            if mirrored and isinstance(rendered, str):
+                mirrored = self._mirror_ccr_to_python_store(rendered, strategy, query, None)
+        if not mirrored:
+            # A marker the store did not take points nowhere: keep the input.
+            return {
+                "items": items_json,
+                "ccr_hash": None,
+                "dropped_summary": "",
+                "strategy_info": "passthrough",
+                "compacted": None,
+                "compaction_kind": None,
+            }
         return result
 
     def compact_document_json(self, doc_json: str) -> str:
@@ -490,13 +846,8 @@ class SmartCrusher(Transform):
         result: str = self._rust.compact_document_json(doc_json)
         # Mirror any opaque-blob markers the walker emitted into the
         # Python store so /v1/retrieve resolves them.
-        if "<<ccr:" in result:
-            self._mirror_ccr_markers_in_text(
-                result,
-                strategy="smart_crusher_compact_document",
-                query_context="",
-                tool_name=None,
-            )
+        if not self._mirror_ccr_to_python_store(result, "smart_crusher_compact_document", "", None):
+            return doc_json  # a marker the store did not take points nowhere
         return result
 
     def ccr_get(self, hash_key: str) -> str | None:
@@ -531,8 +882,30 @@ class SmartCrusher(Transform):
         threaded through to TOIN's per-tool learning records; if no
         tool name is available (e.g. the legacy pipeline doesn't have
         one in scope) the recording uses content-based signature only.
+
+        This is the path `apply()` actually calls for every compressed
+        tool/tool_result message — so it's also where audit-safe mode
+        (`audit_safe=True` + `protected_patterns`, #1705) has to hook
+        in to matter in production, not just via the `crush_array_json`
+        convenience API. See `_apply_audit_safe_protection_to_content`.
         """
+        protected = self._scan_protected_rows(content)
         crushed, was_modified, info = self._rust.smart_crush_content(content, query_context, bias)
+        if protected:
+            crushed, was_modified, info = self._apply_audit_safe_protection_to_content(
+                protected, content, crushed, was_modified, info
+            )
+        # Bridge any CCR markers (row-drop sentinels or opaque-blob
+        # substitutions) emitted by the Rust crusher into the Python
+        # compression_store so /v1/retrieve resolves them; a marker the
+        # store did not take points nowhere, so keep the input instead.
+        if not self._mirror_ccr_to_python_store(
+            rendered=crushed,
+            strategy=info or "smart_crusher",
+            query_context=query_context,
+            tool_name=tool_name,
+        ):
+            return content, False, "passthrough"
         # Same passthrough filter as `crush()` — re-canonicalization of
         # JSON whitespace can flip `was_modified=True` even when the
         # `info` field reports `passthrough` and no compression happened.
@@ -544,15 +917,6 @@ class SmartCrusher(Transform):
                 query_context=query_context,
                 tool_name=tool_name,
             )
-        # Bridge any CCR markers (row-drop sentinels or opaque-blob
-        # substitutions) emitted by the Rust crusher into the Python
-        # compression_store so /v1/retrieve resolves them.
-        self._mirror_ccr_to_python_store(
-            rendered=crushed,
-            strategy=info or "smart_crusher",
-            query_context=query_context,
-            tool_name=tool_name,
-        )
         return crushed, was_modified, info
 
     def _record_to_toin(
@@ -669,10 +1033,11 @@ class SmartCrusher(Transform):
     # `compression_store.store(..., explicit_hash=hash)` so the Python
     # store is keyed by the exact hash that's in the prompt marker.
     #
-    # Best-effort by design: a missing compression_store import (e.g.
-    # in a stripped CLI build) or a transient store error must NOT
-    # break compression itself. Compression has already succeeded; the
-    # bridge just makes /v1/retrieve work. Errors log at debug.
+    # A missing compression_store import (a stripped CLI build) or a
+    # marker whose hash the Rust store does not hold is not a failure. A
+    # store error is: the mirror returns False and the caller keeps the
+    # input uncompressed, since a marker nobody stored never resolves on
+    # another replica. Store errors log at warning; nothing raises.
 
     def _mirror_ccr_to_python_store(
         self,
@@ -680,9 +1045,10 @@ class SmartCrusher(Transform):
         strategy: str,
         query_context: str,
         tool_name: str | None,
-    ) -> None:
+    ) -> bool:
         """Walk `rendered` for any `<<ccr:HASH ...>>` markers and mirror
-        each into the Python `compression_store`.
+        each into the Python `compression_store`. Returns whether every
+        marker's original was stored (True when there is none).
 
         `rendered` may be a JSON string (the standard SmartCrusher
         output format) or arbitrary text. We try the structured walk
@@ -690,8 +1056,8 @@ class SmartCrusher(Transform):
         """
         # Cheap pre-filter — most outputs have no marker at all.
         if "<<ccr:" not in rendered:
-            return
-        self._mirror_ccr_markers_in_text(
+            return True
+        return self._mirror_ccr_markers_in_text(
             rendered,
             strategy=strategy,
             query_context=query_context,
@@ -704,9 +1070,9 @@ class SmartCrusher(Transform):
         strategy: str,
         query_context: str,
         tool_name: str | None,
-    ) -> None:
+    ) -> bool:
         """Find every distinct `<<ccr:HASH...>>` hash in `rendered` and
-        mirror Rust→Python store for each.
+        mirror Rust→Python store for each; whether all were stored.
 
         Tries JSON-tree walk first (structured, handles nested shapes);
         falls back to a token scan if `rendered` isn't valid JSON.
@@ -723,15 +1089,15 @@ class SmartCrusher(Transform):
             # always re-serializes via `python_safe_json_dumps`). Fall
             # through to a string-token scan so we still bridge.
             self._collect_ccr_hashes_from_string(rendered, hashes)
-        if not hashes:
-            return
-        for h in hashes:
+        return all(
             self._mirror_single_hash_to_python_store(
                 h,
                 strategy=strategy,
                 query_context=query_context,
                 tool_name=tool_name,
             )
+            for h in hashes
+        )
 
     @staticmethod
     def _collect_ccr_hashes(value: Any, sink: set[str]) -> None:
@@ -790,9 +1156,10 @@ class SmartCrusher(Transform):
         strategy: str,
         query_context: str,
         tool_name: str | None,
-    ) -> None:
+    ) -> bool:
         """Mirror a single Rust-stored CCR entry into the Python
-        compression_store, keyed by `ccr_hash`. Best-effort.
+        compression_store, keyed by `ccr_hash`. False when the store did
+        not take it; True when stored or there is nothing to mirror.
         """
         canonical = self._rust.ccr_get(ccr_hash)
         if canonical is None:
@@ -804,20 +1171,20 @@ class SmartCrusher(Transform):
                 "CCR mirror: hash %s not in Rust store (skipped)",
                 ccr_hash,
             )
-            return
+            return True
         try:
             from ..cache.compression_store import get_compression_store
         except ImportError:
             # Stripped build without the compression_store module.
             # Mirror is a no-op; Rust side still serves the data.
             logger.debug("CCR mirror: compression_store module unavailable")
-            return
+            return True
         try:
             store = get_compression_store()
         except Exception as e:  # pragma: no cover - defensive
-            logger.debug("CCR mirror: cannot get compression_store (%s)", e)
-            return
-        # The TTL on the Python store defaults to 5 minutes — same as
+            logger.warning("CCR mirror: cannot get compression_store (%s)", safe_id(e))
+            return False
+        # The TTL on the Python store defaults to 30 minutes — same as
         # the Rust store's `DEFAULT_TTL` (see crates/headroom-core/src/
         # ccr/mod.rs). No need to override.
         try:
@@ -834,6 +1201,7 @@ class SmartCrusher(Transform):
                 compression_strategy=strategy,
                 explicit_hash=ccr_hash,
             )
+            return True
         except ValueError:
             # explicit_hash validation failed — the marker had a
             # malformed hash (shouldn't happen in practice).
@@ -841,8 +1209,14 @@ class SmartCrusher(Transform):
                 "CCR mirror: invalid hash %r from rendered marker",
                 ccr_hash,
             )
-        except Exception as e:  # pragma: no cover - defensive
-            logger.debug("CCR mirror: store.store() raised (%s)", e)
+            return False
+        except Exception as e:
+            # Store backends can echo the payload in errors, so no level logs it;
+            # describe_exception keeps only types and code locations.
+            logger.warning("CCR mirror: store write failed (%s) for hash %s", safe_id(e), ccr_hash)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("CCR mirror store failure detail: %s", describe_exception(e))
+            return False
 
     def _extract_context_from_messages(self, messages: list[dict[str, Any]]) -> str:
         """Build a query string from the last 5 user messages + recent
@@ -875,7 +1249,12 @@ class SmartCrusher(Transform):
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
                 for tc in msg.get("tool_calls", []):
                     if isinstance(tc, dict):
-                        func = tc.get("function", {})
+                        # `tc.get("function", {})` returns None for an explicit
+                        # {"function": null} (the default only applies to a
+                        # missing key), and `.get` on None raises AttributeError,
+                        # crashing apply(). Use the null-safe form the sibling
+                        # `_build_tool_name_index` already uses (line ~118).
+                        func = tc.get("function") or {}
                         args = func.get("arguments", "")
                         if isinstance(args, str) and args:
                             context_parts.append(args)
@@ -948,6 +1327,16 @@ class SmartCrusher(Transform):
 
             # OpenAI-style: top-level role=tool with string content.
             if msg.get("role") == "tool":
+                # #1077: never re-compress headroom_retrieve results — they ARE
+                # already-retrieved CCR content; compressing them again creates an
+                # unresolvable retrieval loop.
+                # ponytail: ceiling is tool_call_id lookup; if the id is missing we
+                # compress (conservative: unknown tool names don't get a free pass).
+                if is_tool_excluded(
+                    tool_names_by_id.get(msg.get("tool_call_id") or "") or "",
+                    (CCR_TOOL_NAME,),
+                ):
+                    continue
                 content = msg.get("content", "")
                 if isinstance(content, str):
                     tokens = tokenizer.count_text(content)
@@ -971,6 +1360,15 @@ class SmartCrusher(Transform):
             if isinstance(content, list):
                 for i, block in enumerate(content):
                     if not isinstance(block, dict) or block.get("type") != "tool_result":
+                        continue
+                    # #1077: skip headroom_retrieve results — compressing them
+                    # would produce a new <<ccr:hash>> marker the agent cannot
+                    # redeem (infinite retrieval loop).
+                    # ponytail: ceiling is tool_use_id lookup; unknown ids pass through.
+                    if is_tool_excluded(
+                        tool_names_by_id.get(block.get("tool_use_id") or "") or "",
+                        (CCR_TOOL_NAME,),
+                    ):
                         continue
                     tool_content = block.get("content", "")
                     if not isinstance(tool_content, str):
@@ -1017,6 +1415,7 @@ def smart_crush_tool_output(
     config: SmartCrusherConfig | None = None,
     ccr_config: CCRConfig | None = None,
     with_compaction: bool = True,
+    lossless_only: bool | None = None,
 ) -> tuple[str, bool, str]:
     """Compress a single tool output. Returns `(crushed, was_modified, info)`.
 
@@ -1024,6 +1423,14 @@ def smart_crush_tool_output(
     Defaults to the PR4 lossless-first behavior; pass
     `with_compaction=False` to exercise the legacy lossy-only path
     (still useful for retention-property tests).
+
+    `lossless_only=True` forces strict lossless mode: the output is
+    marker-free and byte-recoverable (no row drops, opaque blobs inline).
     """
-    crusher = SmartCrusher(config=config, ccr_config=ccr_config, with_compaction=with_compaction)
+    crusher = SmartCrusher(
+        config=config,
+        ccr_config=ccr_config,
+        with_compaction=with_compaction,
+        lossless_only=lossless_only,
+    )
     return crusher._smart_crush_content(content)

@@ -22,6 +22,8 @@ from ``e2e/init/Dockerfile``).
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -43,12 +45,37 @@ from e2e._lib import (  # noqa: E402
     run_cases,
 )
 from headroom.cli import init as init_cli  # noqa: E402
+from headroom.install.runtime import resolve_headroom_command  # noqa: E402
 
 # ----- helpers reused across cases --------------------------------------------
 
 # Docker image builds the workspace at /workspace; the marketplace source
 # falls back to that repo checkout when a local marketplace manifest is found.
 REPO_ROOT_IN_CONTAINER = Path("/workspace")
+
+
+def _expected_headroom_mcp_calls(proxy_url: str) -> list[list[str]]:
+    # The harness restores PATH before assertions, but `headroom init` ran with a
+    # scrubbed PATH where the console-script entrypoint may be unavailable.
+    prefix = [
+        "mcp",
+        "add",
+        "headroom",
+        "-s",
+        "user",
+        "-e",
+        f"HEADROOM_PROXY_URL={proxy_url}",
+        "--",
+    ]
+    variants = [
+        [*prefix, *resolve_headroom_command(), "mcp", "serve"],
+        [*prefix, sys.executable, "-m", "headroom.cli", "mcp", "serve"],
+    ]
+    deduped: list[list[str]] = []
+    for variant in variants:
+        if variant not in deduped:
+            deduped.append(variant)
+    return deduped
 
 
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
@@ -111,25 +138,70 @@ def _verify_claude_local(ctx: CaseContext) -> None:
     # being dead pointers for users who never ran `headroom mcp install`).
     # The `-e HEADROOM_PROXY_URL=…` arg is only emitted when the proxy
     # port differs from the 8787 default; this case uses --port 9011.
-    expected = [
+    expected_prefix = [
         ["plugin", "marketplace", "add", str(REPO_ROOT_IN_CONTAINER)],
         ["plugin", "install", "headroom@headroom-marketplace", "--scope", "local"],
-        [
-            "mcp",
-            "add",
-            "headroom",
-            "-s",
-            "user",
-            "-e",
-            "HEADROOM_PROXY_URL=http://127.0.0.1:9011",
-            "--",
-            "headroom",
-            "mcp",
-            "serve",
-        ],
     ]
-    if claude_calls != expected:
+    expected_mcp_calls = _expected_headroom_mcp_calls("http://127.0.0.1:9011")
+    if (
+        len(claude_calls) != 3
+        or claude_calls[:2] != expected_prefix
+        or claude_calls[2] not in expected_mcp_calls
+    ):
         raise AssertionError(f"Unexpected Claude install commands: {claude_calls}")
+
+
+def _expect_shell_exports(shell_file: Path, expected: dict[str, str]) -> None:
+    """Check exported values in a child process after sourcing an rc file.
+
+    Args:
+        shell_file: Scratch shell configuration written by the init case.
+        expected: Environment variables that init must export verbatim.
+
+    Raises:
+        AssertionError: If sourcing fails or the exported values differ.
+    """
+    # Clear inherited values so missing exports cannot accidentally pass. A
+    # separate Python child also distinguishes assignments from real exports.
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if name not in expected and name not in {"BASH_ENV", "ENV"}
+    }
+    probe = (
+        "import json, os, sys; "
+        "print(json.dumps({name: os.environ.get(name) for name in sys.argv[1:]}))"
+    )
+    try:
+        result = subprocess.run(
+            [
+                "bash",
+                "--noprofile",
+                "--norc",
+                "-c",
+                '. "$1" && "$2" -c "$3" "${@:4}"',
+                "headroom-env-check",
+                str(shell_file),
+                sys.executable,
+                probe,
+                *expected,
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise AssertionError(f"{shell_file.name} could not be sourced successfully") from exc
+    try:
+        actual = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(
+            f"{shell_file.name} did not produce exported environment values"
+        ) from exc
+    if actual != expected:
+        raise AssertionError(f"{shell_file.name} exported {actual!r}; expected {expected!r}")
 
 
 def _verify_copilot_global(ctx: CaseContext) -> None:
@@ -141,15 +213,13 @@ def _verify_copilot_global(ctx: CaseContext) -> None:
     session_start = config["hooks"]["SessionStart"][0]["command"]
     _expect_hook_command(session_start, "init-user")
 
+    expected_env = {
+        "COPILOT_PROVIDER_TYPE": "openai",
+        "COPILOT_PROVIDER_BASE_URL": "http://127.0.0.1:9005/v1",
+        "COPILOT_PROVIDER_WIRE_API": "completions",
+    }
     for shell_file in (ctx.home / ".bashrc", ctx.home / ".zshrc", ctx.home / ".profile"):
-        content = shell_file.read_text(encoding="utf-8")
-        for literal in (
-            'export COPILOT_PROVIDER_TYPE="openai"',
-            'export COPILOT_PROVIDER_BASE_URL="http://127.0.0.1:9005/v1"',
-            'export COPILOT_PROVIDER_WIRE_API="completions"',
-        ):
-            if literal not in content:
-                raise AssertionError(f"{shell_file.name} missing {literal!r}")
+        _expect_shell_exports(shell_file, expected_env)
 
     copilot_calls = [
         record["argv"] for record in _read_jsonl(ctx.shim_log) if record["tool"] == "copilot"

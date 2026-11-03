@@ -31,6 +31,17 @@ export OPENAI_API_KEY='your-key'
 python examples/streaming_example.py
 ```
 
+### tabular_compression_demo.py
+
+Tabular + spreadsheet compression on generated sample data (no API key needed).
+Shows where CSV/markdown tables and `.xlsx` workbooks compress and where compact,
+all-unique data correctly passes through:
+
+```bash
+python examples/tabular_compression_demo.py            # run all scenarios
+python examples/tabular_compression_demo.py --write DIR # also save the sample files
+```
+
 ## Evaluation Examples
 
 ### smart_vs_naive_eval.py
@@ -85,6 +96,21 @@ MCP (Model Context Protocol) integration demo:
 export OPENAI_API_KEY='your-key'
 PYTHONPATH=. python -m examples.mcp_demo.run_agent_eval
 ```
+
+### vertex_gemini_benchmark/
+
+Gemini 3.8 Flash on Google Cloud Vertex AI (Gemini Enterprise Agent Platform) benchmark:
+
+```bash
+# Ensure Google Cloud ADC is active
+gcloud auth application-default login
+export GCP_PROJECT_ID="your-project-id"
+
+# Run comparative benchmark (Direct vs Headroom Proxied)
+python examples/vertex_gemini_benchmark/benchmark.py --model gemini-3.8-flash
+```
+
+See [vertex_gemini_benchmark/README.md](vertex_gemini_benchmark/README.md) for full benchmark scenarios and methodology.
 
 ### strands_bedrock_demo.py
 

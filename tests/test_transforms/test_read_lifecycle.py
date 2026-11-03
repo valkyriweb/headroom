@@ -142,6 +142,7 @@ def make_anthropic_tool_result(tool_call_id: str, content: str) -> dict:
 
 LARGE_CONTENT = "x" * 2000  # Well above min_size_bytes
 SMALL_CONTENT = "tiny"  # Below min_size_bytes
+REJECTED_EDIT = "<tool_use_error>String to replace not found in file.</tool_use_error>"
 
 
 # =============================================================================
@@ -436,6 +437,94 @@ class TestAnthropicFormat:
         user_msg = result.messages[1]
         assert user_msg["content"][0]["content"] == LARGE_CONTENT
 
+    def test_failed_edit_does_not_make_read_stale(self):
+        """A tool_result with is_error means the edit did not happen."""
+        mgr = ReadLifecycleManager(ReadLifecycleConfig(enabled=True))
+
+        failed = make_anthropic_tool_result("e1", REJECTED_EDIT)
+        failed["content"][0]["is_error"] = True
+        messages = [
+            make_anthropic_read("r1", "/src/app.py"),
+            make_anthropic_tool_result("r1", LARGE_CONTENT),
+            make_anthropic_edit("e1", "/src/app.py"),
+            failed,
+        ]
+
+        result = mgr.apply(messages)
+        assert result.reads_stale == 0
+        assert result.reads_fresh == 1
+        assert result.messages[1]["content"][0]["content"] == LARGE_CONTENT
+
+    def test_successful_edit_after_failed_edit_still_makes_read_stale(self):
+        mgr = ReadLifecycleManager(ReadLifecycleConfig(enabled=True))
+
+        failed = make_anthropic_tool_result("e1", REJECTED_EDIT)
+        failed["content"][0]["is_error"] = True
+        messages = [
+            make_anthropic_read("r1", "/src/app.py"),
+            make_anthropic_tool_result("r1", LARGE_CONTENT),
+            make_anthropic_edit("e1", "/src/app.py"),
+            failed,
+            make_anthropic_edit("e2", "/src/app.py"),
+            make_anthropic_tool_result("e2", "edit success"),
+        ]
+
+        result = mgr.apply(messages)
+        assert result.reads_stale == 1
+
+    def test_interrupted_edit_still_makes_read_stale(self):
+        """An error that is not a pre-run rejection may have changed the file."""
+        mgr = ReadLifecycleManager(ReadLifecycleConfig(enabled=True))
+
+        failed = make_anthropic_tool_result(
+            "e1",
+            "Interrupted: the response that made this tool call was stopped while "
+            "the call was running; it may have partially or fully completed.",
+        )
+        failed["content"][0]["is_error"] = True
+        messages = [
+            make_anthropic_read("r1", "/src/app.py"),
+            make_anthropic_tool_result("r1", LARGE_CONTENT),
+            make_anthropic_edit("e1", "/src/app.py"),
+            failed,
+        ]
+
+        result = mgr.apply(messages)
+        assert result.reads_stale == 1
+
+    def test_rejected_edit_with_text_block_content_keeps_read_fresh(self):
+        mgr = ReadLifecycleManager(ReadLifecycleConfig(enabled=True))
+
+        failed = make_anthropic_tool_result("e1", "")
+        failed["content"][0]["content"] = [{"type": "text", "text": REJECTED_EDIT}]
+        failed["content"][0]["is_error"] = True
+        messages = [
+            make_anthropic_read("r1", "/src/app.py"),
+            make_anthropic_tool_result("r1", LARGE_CONTENT),
+            make_anthropic_edit("e1", "/src/app.py"),
+            failed,
+        ]
+
+        result = mgr.apply(messages)
+        assert result.reads_stale == 0
+        assert result.messages[1]["content"][0]["content"] == LARGE_CONTENT
+
+    def test_error_result_with_non_string_tool_use_id_is_ignored(self):
+        mgr = ReadLifecycleManager(ReadLifecycleConfig(enabled=True))
+
+        bad = make_anthropic_tool_result("e1", REJECTED_EDIT)
+        bad["content"][0]["tool_use_id"] = ["e1"]
+        bad["content"][0]["is_error"] = True
+        messages = [
+            make_anthropic_read("r1", "/src/app.py"),
+            make_anthropic_tool_result("r1", LARGE_CONTENT),
+            bad,
+        ]
+
+        result = mgr.apply(messages)
+        assert result.reads_fresh == 1
+        assert result.messages[1]["content"][0]["content"] == LARGE_CONTENT
+
 
 class TestCCRStoreIntegration:
     """Lifecycle manager stores originals in CCR."""
@@ -610,3 +699,92 @@ class TestNoFilePathHandling:
         # Can't match file_path, so Read is not classified at all
         assert result.reads_total == 0
         assert result.messages[1]["content"] == LARGE_CONTENT
+
+
+class TestContentRouterIntegration:
+    """Regression: ContentRouter.transform must wire a real CCR store into
+    ReadLifecycleManager so STALE Read markers resolve via headroom_retrieve."""
+
+    def test_stale_read_marker_retrievable_via_compress(self, monkeypatch):
+        import re
+
+        # Force an in-memory backend so the test is hermetic.
+        monkeypatch.setenv("HEADROOM_CCR_BACKEND", "memory")
+
+        from headroom import compress
+        from headroom.cache.compression_store import (
+            get_compression_store,
+            reset_compression_store,
+        )
+
+        reset_compression_store()
+        try:
+            large_content = "source line\n" * 500  # above read_lifecycle min_size_bytes
+            messages = [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "t1",
+                            "name": "Read",
+                            "input": {"file_path": "/tmp/foo.txt"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "t1",
+                            "content": large_content,
+                        }
+                    ],
+                },
+                # Edit the same file -> the Read above becomes STALE.
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "t2",
+                            "name": "Edit",
+                            "input": {"file_path": "/tmp/foo.txt"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "t2",
+                            "content": "edited",
+                        }
+                    ],
+                },
+            ]
+
+            result = compress(messages, model="claude-sonnet-4-5-20250929")
+
+            hashes: list[str] = []
+            for m in result.messages:
+                content = m.get("content")
+                if isinstance(content, list):
+                    for b in content:
+                        if isinstance(b, dict) and b.get("type") == "tool_result":
+                            s = b.get("content", "")
+                            if isinstance(s, str):
+                                hashes.extend(re.findall(r"hash=([a-f0-9]+)", s))
+            assert hashes, "Expected a STALE Read marker with a hash"
+
+            store = get_compression_store()
+            entry = store.retrieve(hashes[0])
+            assert entry is not None, "STALE Read marker hash not in CCR store"
+            assert entry.tool_name == "Read"
+            assert entry.compression_strategy == "read_lifecycle:stale"
+        finally:
+            # Drop the memory-backend singleton so later tests in the suite
+            # see the env-driven default again.
+            reset_compression_store()

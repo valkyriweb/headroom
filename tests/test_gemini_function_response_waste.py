@@ -89,6 +89,23 @@ class TestFunctionResponseConversion:
         # verbatim on the wire regardless of the telemetry conversion.
         assert preserved == {1}
 
+    def test_flag_emits_tool_message_for_snake_case_function_response(self, proxy):
+        """The REST API also accepts ``function_response``; its payload counts too."""
+        payload = _big_payload()
+        contents = [
+            {"role": "user", "parts": [{"text": "fetch the data"}]},
+            {
+                "role": "user",
+                "parts": [{"function_response": {"name": "fetch_data", "response": payload}}],
+            },
+        ]
+        messages, preserved = proxy._gemini_contents_to_messages(
+            contents, include_function_responses=True
+        )
+        assert [m["role"] for m in messages] == ["user", "tool"]
+        assert json.loads(messages[1]["content"]) == payload
+        assert preserved == {1}
+
     def test_flag_passes_string_response_through(self, proxy):
         contents = [_function_response_content("plain text tool output")]
         messages, _ = proxy._gemini_contents_to_messages(contents, include_function_responses=True)
@@ -122,6 +139,45 @@ class TestFunctionResponseConversion:
         circular["self"] = circular
         text = proxy._function_response_text({"response": circular})
         assert "loop" in text
+
+
+class TestMalformedPartsToleration:
+    """A request-controlled `parts` that is null or carries non-dict elements
+    must not crash the compression-path conversion helpers."""
+
+    def test_null_parts_does_not_crash(self, proxy):
+        contents = [
+            {"role": "user", "parts": None},
+            {"role": "user", "parts": [{"text": "real"}]},
+        ]
+        messages, preserved = proxy._gemini_contents_to_messages(contents)
+        assert messages == [{"role": "user", "content": "real"}]
+        assert preserved == set()
+
+    def test_string_part_elements_do_not_crash(self, proxy):
+        # A client that treats `parts` as a string array sends bare strings;
+        # they carry no `text` key, so they contribute nothing but must not
+        # crash `.get`.
+        contents = [{"role": "user", "parts": ["bare string", {"text": "kept"}]}]
+        messages, _ = proxy._gemini_contents_to_messages(contents)
+        assert messages == [{"role": "user", "content": "kept"}]
+
+    def test_null_part_element_is_skipped(self, proxy):
+        contents = [{"role": "user", "parts": [None, {"text": "kept"}]}]
+        messages, _ = proxy._gemini_contents_to_messages(contents)
+        assert messages == [{"role": "user", "content": "kept"}]
+
+    def test_has_non_text_parts_tolerates_null_parts(self, proxy):
+        assert proxy._has_non_text_parts({"role": "user", "parts": None}) is False
+        assert proxy._has_non_text_parts({"role": "user", "parts": ["str"]}) is False
+        assert proxy._has_non_text_parts({"parts": [{"inlineData": {"data": "x"}}]}) is True
+
+    def test_non_dict_content_entry_is_tolerated(self, proxy):
+        # A non-dict entry in contents[] is treated as an empty user turn rather
+        # than crashing content.get / the parts iteration.
+        contents = ["not a dict", {"role": "user", "parts": [{"text": "kept"}]}]
+        messages, _ = proxy._gemini_contents_to_messages(contents)
+        assert messages == [{"role": "user", "content": "kept"}]
 
 
 class TestFunctionResponseWasteParsing:

@@ -2,7 +2,37 @@
 
 import click
 
+from headroom.offline import OfflineEgressBlocked
+
 CLI_CONTEXT_SETTINGS = {"help_option_names": ["--help", "-?"]}
+
+
+class OfflineAwareGroup(click.Group):
+    """The CLI's single translation point for an air-gap refusal.
+
+    ``OfflineEgressBlocked`` is a ``BaseException`` on purpose, so no
+    ``except Exception`` anywhere in the tree can downgrade a policy refusal
+    into "that feature is having a bad day". The cost of that choice is that
+    nothing catches it either — Click's own error handling only knows about
+    ``ClickException``/``Abort``, so an operator who ran ``headroom auth
+    copilot`` on an air-gapped box would have got a stack trace ending in a
+    type they have never heard of.
+
+    Translating here, once, at the outermost boundary of every subcommand,
+    turns it into the ordinary ``Error: ...`` line Click prints for any other
+    bad invocation — with the switch, the feature and the host already in the
+    message, because :class:`OfflineEgressBlocked` builds them in. The guard
+    keeps its unswallowable property everywhere inside; only the last frame
+    before the user's terminal is allowed to make it readable.
+    """
+
+    def invoke(self, ctx: click.Context) -> object:
+        try:
+            return super().invoke(ctx)
+        except OfflineEgressBlocked as blocked:
+            # ``from None``: the traceback is Headroom's own plumbing and
+            # tells the operator nothing they can act on. The message does.
+            raise click.ClickException(str(blocked)) from None
 
 
 def get_version() -> str:
@@ -15,7 +45,7 @@ def get_version() -> str:
         return "unknown"
 
 
-@click.group(context_settings=CLI_CONTEXT_SETTINGS)
+@click.group(cls=OfflineAwareGroup, context_settings=CLI_CONTEXT_SETTINGS)
 @click.version_option(get_version(), "--version", "-v", prog_name="headroom")
 @click.pass_context
 def main(ctx: click.Context) -> None:
@@ -28,8 +58,43 @@ def main(ctx: click.Context) -> None:
         headroom proxy              Start the optimization proxy
         headroom memory list        List stored memories
         headroom memory stats       Show memory statistics
+        headroom update             Update Headroom to the latest release
     """
     ctx.ensure_object(dict)
+
+    # Apply file-backed settings (settings.json) to the process environment
+    # BEFORE Click parses any subcommand's ``envvar=`` options (Click resolves
+    # those when it builds the subcommand context, which happens after this
+    # group callback runs). ``os.environ.setdefault`` keeps explicit shell
+    # exports authoritative over the stored file. Fail-open so a corrupt
+    # settings.json can never block the CLI.
+    try:
+        from headroom import settings_store
+
+        settings_store.apply_to_environ(settings_store.load())
+    except Exception:  # noqa: BLE001 — settings load must never break the CLI
+        pass
+
+    # Verify TLS through the OS trust store for every client in this process
+    # (after settings.json, which may set HEADROOM_CERT_STORE). Corporate
+    # TLS-inspection roots live there; certifi does not have them.
+    try:
+        from headroom.proxy.ssl_context import ensure_process_trust
+
+        ensure_process_trust()
+    except Exception:  # noqa: BLE001 — trust wiring must never break the CLI
+        pass
+
+    # Fire a rate-limited, opt-out background check for newer releases so other
+    # surfaces (e.g. the proxy banner) can show an "update available" notice.
+    # Never blocks, never raises; skipped for `update` (it checks explicitly).
+    if ctx.invoked_subcommand != "update":
+        try:
+            from headroom.update_check import maybe_check_async
+
+            maybe_check_async()
+        except Exception:  # noqa: BLE001 — update check must never break the CLI
+            pass
 
 
 # Import subcommands - these register themselves with the main group
@@ -43,13 +108,19 @@ def _register_commands() -> None:
         doctor,  # noqa: F401
         evals,  # noqa: F401
         init,  # noqa: F401
+        inspect,  # noqa: F401
         install,  # noqa: F401
         learn,  # noqa: F401
         mcp,  # noqa: F401
         output_savings,  # noqa: F401
         perf,  # noqa: F401
         proxy,  # noqa: F401
+        recover,  # noqa: F401
+        rollout,  # noqa: F401
+        savings,  # noqa: F401
+        telemetry,  # noqa: F401
         tools,  # noqa: F401
+        update,  # noqa: F401
         wrap,  # noqa: F401
     )
 
@@ -57,6 +128,15 @@ def _register_commands() -> None:
     try:
         from . import memory  # noqa: F401
     except ImportError:
+        pass
+
+    # Third-party subcommands (headroom.cli_extension entry points). Runs last so
+    # built-ins are already attached and a plugin cannot shadow one.
+    try:
+        from .extensions import register_all
+
+        register_all(main)
+    except Exception:  # noqa: BLE001 — extension discovery must never break the CLI
         pass
 
 

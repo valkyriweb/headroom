@@ -22,11 +22,26 @@ def normalize_text(text: str) -> str:
     return text
 
 
+# CJK has no word spaces, so a CJK run is split into overlapping char bigrams
+# (unigram if length 1) -- this makes token-level F1/recall meaningful instead of
+# all-or-nothing on a whole-string CJK token. ASCII/digit runs are kept whole.
+_CJK = re.compile(r"[㐀-鿿぀-ヿ가-힯]")
+_CJK_OR_OTHER = re.compile(r"[㐀-鿿぀-ヿ가-힯]+|[^㐀-鿿぀-ヿ가-힯]+")
+
+
 def tokenize(text: str) -> list[str]:
-    """Simple word tokenization."""
-    # Split on whitespace and punctuation
-    tokens = re.findall(r"\b\w+\b", text.lower())
-    return tokens
+    """Word tokenization (CJK-aware: CJK runs -> overlapping char bigrams)."""
+    out: list[str] = []
+    for tok in re.findall(r"\b\w+\b", text.lower()):
+        for run in _CJK_OR_OTHER.findall(tok):
+            if _CJK.match(run):
+                if len(run) > 1:
+                    out.extend(run[i : i + 2] for i in range(len(run) - 1))
+                else:
+                    out.append(run)
+            else:
+                out.append(run)
+    return out
 
 
 def compute_exact_match(response_a: str, response_b: str) -> bool:
@@ -62,50 +77,6 @@ def compute_f1(response_a: str, response_b: str) -> float:
     recall = common / len(tokens_b)
 
     return 2 * precision * recall / (precision + recall)
-
-
-def compute_bleu(response_a: str, response_b: str, max_n: int = 4) -> float:
-    """Compute BLEU-like score between two responses.
-
-    Uses n-gram precision up to max_n.
-    """
-    tokens_a = tokenize(response_a)
-    tokens_b = tokenize(response_b)
-
-    if not tokens_a or not tokens_b:
-        return 0.0
-
-    precisions = []
-
-    for n in range(1, max_n + 1):
-        # Get n-grams
-        ngrams_a = [tuple(tokens_a[i : i + n]) for i in range(len(tokens_a) - n + 1)]
-        ngrams_b = [tuple(tokens_b[i : i + n]) for i in range(len(tokens_b) - n + 1)]
-
-        if not ngrams_a:
-            break
-
-        counter_a = Counter(ngrams_a)
-        counter_b = Counter(ngrams_b)
-
-        # Clipped count
-        clipped = sum((counter_a & counter_b).values())
-        total = len(ngrams_a)
-
-        if total > 0:
-            precisions.append(clipped / total)
-        else:
-            precisions.append(0.0)
-
-    if not precisions or all(p == 0 for p in precisions):
-        return 0.0
-
-    # Geometric mean of precisions
-    import math
-
-    nonzero_precisions = [p for p in precisions if p > 0]
-    log_sum = sum(math.log(p) for p in nonzero_precisions) / len(nonzero_precisions)
-    return math.exp(log_sum)
 
 
 def compute_rouge_l(response_a: str, response_b: str) -> float:

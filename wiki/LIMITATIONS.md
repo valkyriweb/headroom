@@ -24,13 +24,13 @@ Headroom includes an AST-aware CodeCompressor (tree-sitter, 8 languages) but it'
 
 **Why code mostly passes through:**
 
-1. **Word count gate**: Content under 50 words is silently skipped
+1. **Token/char gate**: Content under 50 tokens (`min_tokens_to_compress`) or under 500 chars (`min_chars_for_block_compression`, Anthropic content-block path) is silently skipped — this is measured in tokens/chars, not words
 2. **Recent code protection** (`protect_recent_code=4`): Code in the last 4 messages is never compressed. In typical tool-call patterns, the tool result is always "recent"
 3. **Analysis intent protection** (`protect_analysis_context=True`): If the most recent user message contains keywords like "analyze", "review", "explain", "fix", "debug", "optimize", "error", "bug" — ALL code in the conversation is protected
 
 **Why this is the right default**: Code is almost always fetched because the user wants to work with it. Compressing function bodies would remove exactly what they need. LLMs like Claude are excellent at navigating large code files without compression.
 
-**Where code savings come from**: The IntelligentContextManager drops old code messages that are no longer relevant (scoring-based), which is a better strategy than stripping function bodies from active code.
+**Where code savings come from**: Headroom does not strip function bodies from active code or drop old code messages. Code savings come from compressing the newest content blocks (live-zone-only compression) when they are not protected, leaving the conversation history intact.
 
 **Override**: Set `protect_analysis_context=False` in `ContentRouterConfig` for aggressive code compression. Requires `headroom-ai[code]` for tree-sitter.
 
@@ -98,7 +98,7 @@ Errors are logged at WARNING level and never propagated to callers.
 The Tool Output Intelligence Network (TOIN) learns compression patterns from usage. For new tool types:
 
 - No learned patterns exist → falls back to statistical heuristics
-- Confidence below `toin_confidence_threshold` (default 0.3) → TOIN hints ignored
+- Confidence below `toin_confidence_threshold` (default 0.5 at the runtime `SmartCrusherConfig` used by `ContentRouter`; the separate `headroom.config.SmartCrusherConfig` dataclass defaults to 0.3 but is not wired into the router unless explicitly passed) → TOIN hints ignored
 - Patterns build up over time as tools are used repeatedly
 - Cross-session learning requires persistence (`TelemetryConfig.storage_path`)
 
@@ -119,7 +119,7 @@ The Tool Output Intelligence Network (TOIN) learns compression patterns from usa
 ## Performance Characteristics
 
 - **ContentRouter** accounts for 91-98% of pipeline cost — it does the actual compression work
-- **CacheAligner** and **RollingWindow** are sub-millisecond
+- **CacheAligner** is sub-millisecond
 - Scaling is roughly **linear** with input size
 - Full benchmark data: [LATENCY_BENCHMARKS.md](LATENCY_BENCHMARKS.md)
 
@@ -136,4 +136,4 @@ The Tool Output Intelligence Network (TOIN) learns compression patterns from usa
 | `protect_analysis_context` | True | Protect code when user asks about it |
 | `protect_recent_code` | 4 | Messages from end to protect code |
 | `skip_user_messages` | True | Never compress user messages |
-| `toin_confidence_threshold` | 0.3 | Minimum TOIN confidence to apply hints |
+| `toin_confidence_threshold` | 0.5 (transforms-level `SmartCrusherConfig`, the one actually used by `ContentRouter`; the exported `headroom.config.SmartCrusherConfig` defaults to 0.3 but isn't wired in by default) | Minimum TOIN confidence to apply hints |

@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any
 
+from headroom.offline import OfflineEgressBlocked, guard_egress, note_refusal
 from headroom.subscription.base import QuotaTracker
 
 logger = logging.getLogger(__name__)
@@ -163,7 +164,13 @@ def parse_copilot_quota(data: dict[str, Any]) -> CopilotQuotaSnapshot:
         raw = raw_qs.get(cat_name)
         if not raw:
             continue
-        remaining = raw.get("remaining") or raw.get("quota_remaining")
+        # Use an explicit None check, not `or`: a fully-consumed category reports
+        # `remaining: 0`, and `0 or raw.get("quota_remaining")` would discard that
+        # legitimate 0 (→ None), so `used`/`used_percent` then render the exhausted
+        # quota as unknown / 0% on the dashboard.
+        remaining = raw.get("remaining")
+        if remaining is None:
+            remaining = raw.get("quota_remaining")
         cat = CopilotQuotaCategory(
             name=cat_name,
             entitlement=raw.get("entitlement"),
@@ -308,6 +315,7 @@ class _CopilotQuotaTracker(QuotaTracker):
         }
 
         try:
+            guard_egress("GitHub Copilot quota polling", _GITHUB_API_BASE)
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
@@ -327,6 +335,13 @@ class _CopilotQuotaTracker(QuotaTracker):
                         return
 
                     data = await resp.json()
+        except OfflineEgressBlocked as blocked:
+            # Say it twice, in the two places an operator looks: once in the
+            # log, and once in the quota panel's own error slot, so the empty
+            # panel carries its reason instead of looking like a broken poll.
+            with self._lock:
+                self._state.last_error = note_refusal(blocked, logger)
+            return
         except Exception as exc:
             with self._lock:
                 self._state.last_error = str(exc)

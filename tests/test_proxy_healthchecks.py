@@ -8,7 +8,7 @@ pytest.importorskip("httpx")
 
 from fastapi.testclient import TestClient
 
-from headroom.proxy.server import ProxyConfig, create_app
+from headroom.proxy.server import ProxyConfig, __version__, create_app
 
 
 @pytest.fixture
@@ -23,7 +23,9 @@ def client(monkeypatch):
         cost_tracking_enabled=False,
     )
     app = create_app(config)
-    with TestClient(app) as test_client:
+    # Loopback client/Host: /health serves the `config` block only to loopback
+    # callers (network callers get the /readyz-shape body, no config).
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as test_client:
         yield test_client
 
 
@@ -35,6 +37,7 @@ def test_livez_reports_process_health(client):
     assert data["service"] == "headroom-proxy"
     assert data["status"] == "healthy"
     assert data["alive"] is True
+    assert data["version"] == __version__
     assert data["uptime_seconds"] >= 0
 
 
@@ -71,6 +74,7 @@ def test_health_preserves_backwards_compatible_config_payload(client):
     data = response.json()
     assert data["status"] == "healthy"
     assert data["ready"] is True
+    assert data["version"] == __version__
     config = data["config"]
     assert config["backend"] == "anthropic"
     assert config["optimize"] is False
@@ -84,6 +88,8 @@ def test_health_preserves_backwards_compatible_config_payload(client):
     assert config["max_items_after_crush"] == 50
     assert config["smart_crusher_with_compaction"] is None
     assert isinstance(config["pid"], int)
+    # `headroom wrap` reads this on proxy reuse to warn on a mode mismatch.
+    assert config["mode"] in ("token", "cache")
 
 
 def test_health_reports_agent_savings_config():
@@ -105,7 +111,7 @@ def test_health_reports_agent_savings_config():
     )
     app = create_app(config)
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
         response = client.get("/health")
 
     assert response.status_code == 200
@@ -327,3 +333,21 @@ def test_health_includes_upstream_check_result(monkeypatch):
     assert "enabled" in upstream
     assert "ready" in upstream
     assert "status" in upstream
+
+
+def test_health_reports_enabled_proxy_extensions():
+    """`headroom wrap` reads this to carry the shared proxy's extensions over to a
+    dedicated proxy it has to start beside it."""
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        proxy_extensions=["routemegood", "observability"],
+    )
+    app = create_app(config)
+
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
+        reported = client.get("/health").json()["config"]
+
+    assert reported["proxy_extensions"] == ["observability", "routemegood"]

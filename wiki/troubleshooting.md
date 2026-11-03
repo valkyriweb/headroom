@@ -23,8 +23,8 @@ headroom proxy --port 8788
 # 3. Check for missing dependencies
 pip install "headroom-ai[proxy]"
 
-# 4. Run with debug logging
-headroom proxy --log-level debug
+# 4. Run with request logging
+headroom proxy --log-file ~/.headroom/logs/proxy.jsonl --log-messages
 ```
 
 ### "Connection refused" when calling proxy
@@ -69,7 +69,7 @@ Alternatively, restarting the proxy process clears the in-memory tracker. See [S
 
 ```bash
 # 1. Check proxy logs for the actual error
-headroom proxy --log-level debug
+headroom proxy --log-file ~/.headroom/logs/proxy.jsonl --log-messages
 
 # 2. Verify API key is set
 echo $OPENAI_API_KEY  # or ANTHROPIC_API_KEY
@@ -224,6 +224,7 @@ client = HeadroomClient(
 # 2. For temp directory storage
 import tempfile
 import os
+
 db_path = os.path.join(tempfile.gettempdir(), "headroom.db")
 client = HeadroomClient(
     original_client=OpenAI(),
@@ -287,6 +288,7 @@ pip install --upgrade headroom-ai
 ```python
 # Check available imports
 import headroom
+
 print(dir(headroom))
 
 # Common imports:
@@ -397,6 +399,7 @@ print(f"Waste signals: {plan.waste_signals}")
 
 # See the actual optimized messages
 import json
+
 print(json.dumps(plan.messages_optimized, indent=2))
 ```
 
@@ -438,6 +441,79 @@ result = crusher.apply(messages, tokenizer)
 print(f"Tokens: {result.tokens_before} -> {result.tokens_after}")
 print(f"Compressed content: {result.messages[0]['content'][:200]}...")
 ```
+
+---
+
+### "Native detector crashes with illegal instruction"
+
+On some older or virtualized x86_64 CPUs, AVX2 may be unavailable. The
+Magika/ONNX Runtime detector can require AVX2 through its precompiled runtime
+binary. Headroom skips that detector tier on x86/x86_64 hosts without AVX2 and
+falls back to non-Magika detection tiers instead of crashing.
+
+If native startup still fails on an older CPU, set:
+
+```bash
+export HEADROOM_REQUIRE_RUST_CORE=false
+```
+
+---
+
+### Windows: "DLL load failed while importing _core"
+
+Symptoms: the proxy exits at startup with
+
+```
+FATAL: Rust extension `headroom._core` not loadable.
+    error: ImportError: DLL load failed while importing _core: ...
+```
+
+and clients pointed at `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` get
+`ConnectionRefused`.
+
+The compiled extension `headroom\_core.pyd` ships unsigned. Windows Smart App
+Control, WDAC, or antivirus can therefore refuse to load it, and Smart App
+Control has no per-file allowlist: it is a system-wide, one-way switch. Confirm
+it is the OS blocking the file rather than a broken install:
+
+```powershell
+# Where the extension lives (adjust for your install method)
+$core = "$env:APPDATA\uv\tools\headroom-ai\Lib\site-packages\headroom\_core.pyd"
+Get-AuthenticodeSignature $core | Format-List Status, StatusMessage
+
+# Code Integrity block events, if any
+Get-WinEvent -LogName "Microsoft-Windows-CodeIntegrity/Operational" -MaxEvents 20 |
+    Where-Object Id -in 3033, 3077, 3118 | Format-List TimeCreated, Id, Message
+```
+
+A `Status: NotSigned` plus event 3033 or 3077 naming `_core.pyd` confirms it.
+
+To keep the proxy serving while the block is in place, start it in degraded
+mode. The proxy stays up and forwards traffic **unoptimized** (you lose the token
+savings, not the connection), `/health` reports `"rust_core": "disabled"`, and
+the startup log carries one `event=proxy_optimization_disabled` warning so the
+degradation is visible:
+
+```powershell
+$env:HEADROOM_REQUIRE_RUST_CORE = "false"
+headroom proxy
+```
+
+For a scheduled-task or service deployment, bake it into the profile so the
+supervisor passes it to every restart. Supervisors start with a bare
+environment and will not pick up an export from your shell, so re-run
+`install apply` with the options you originally used plus `--env`:
+
+```powershell
+headroom install apply --preset persistent-task --env HEADROOM_REQUIRE_RUST_CORE=false
+headroom install restart
+```
+
+To get compression back you have to let the file load: exclude the `headroom`
+package directory in your antivirus, or turn Smart App Control off (Windows
+Security > App & browser control > Smart App Control). Note that turning it off
+is irreversible without reinstalling Windows, so prefer degraded mode unless you
+were going to disable it anyway.
 
 ---
 

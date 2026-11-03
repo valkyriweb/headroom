@@ -5,48 +5,14 @@ Claude Code subscription users to use CCR (Compress-Cache-Retrieve) without
 needing API key access.
 """
 
-import json
-import shutil
-import subprocess
-from pathlib import Path
-from typing import Any
-
 import click
 
 from .main import main
 
-# Default paths
-CLAUDE_CONFIG_DIR = Path.home() / ".claude"
-MCP_CONFIG_PATH = CLAUDE_CONFIG_DIR / "mcp.json"
 DEFAULT_PROXY_URL = "http://127.0.0.1:8787"
-
-
-def get_headroom_command() -> list[str]:
-    """Get the command to run headroom MCP server.
-
-    Returns the CLI invocation used by Claude Code config.
-    """
-    return ["headroom", "mcp", "serve"]
-
-
-def load_mcp_config() -> dict[str, Any]:
-    """Load existing MCP config or return empty structure."""
-    if MCP_CONFIG_PATH.exists():
-        try:
-            with open(MCP_CONFIG_PATH) as f:
-                result: dict[str, Any] = json.load(f)
-                return result
-        except (json.JSONDecodeError, OSError):
-            return {"mcpServers": {}}
-    return {"mcpServers": {}}
-
-
-def save_mcp_config(config: dict) -> None:
-    """Save MCP config, creating directory if needed."""
-    CLAUDE_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(MCP_CONFIG_PATH, "w") as f:
-        json.dump(config, f, indent=2)
-        f.write("\n")  # Trailing newline
+DEFAULT_HTTP_HOST = "127.0.0.1"
+DEFAULT_HTTP_PORT = 8788
+DEFAULT_HTTP_PATH = "/mcp"
 
 
 @main.group()
@@ -111,9 +77,9 @@ def mcp_install(proxy_url: str, agents: tuple[str, ...], force: bool) -> None:
 
     \b
     By default this installs into every agent that has a registrar and is
-    detected on this system (Claude Code today; Cursor / Codex / Continue /
-    others added in subsequent releases). Pass ``--agent NAME`` one or more
-    times to restrict the installation.
+    detected on this system (Antigravity IDE, Claude Code, Codex, Grok CLI,
+    OpenCode today; Cursor / Continue / others added in subsequent releases).
+    Pass ``--agent NAME`` one or more times to restrict the installation.
 
     \b
     Examples:
@@ -160,71 +126,110 @@ def mcp_install(proxy_url: str, agents: tuple[str, ...], force: bool) -> None:
 
 
 @mcp.command("uninstall")
-def mcp_uninstall() -> None:
-    """Remove Headroom MCP server from Claude Code config.
+@click.option(
+    "--agent",
+    "agents",
+    multiple=True,
+    help="Restrict uninstallation to specific agents (default: every detected agent).",
+)
+def mcp_uninstall(agents: tuple[str, ...]) -> None:
+    """Remove Headroom MCP server from detected agent configs.
 
     \b
-    Removes headroom from both the claude CLI registry (Claude Code CLI >=2.x)
-    and ~/.claude/mcp.json if present. Other MCP servers are preserved.
+    Removes headroom from every agent registrar known to Headroom. Other MCP
+    servers are preserved. Pass ``--agent NAME`` one or more times to restrict
+    the uninstallation.
+
+    \b
+    Examples:
+        headroom mcp uninstall                       # every detected agent
+        headroom mcp uninstall --agent antigravity   # Antigravity IDE only
     """
+    from headroom.mcp_registry import get_all_registrars
+
+    registrars = get_all_registrars()
+    if agents:
+        wanted = {agent.strip().lower() for agent in agents if agent.strip()}
+        registrars = [registrar for registrar in registrars if registrar.name in wanted]
+        if not registrars:
+            click.echo("No agents matched the requested filter.")
+            raise SystemExit(1)
+
     removed = False
 
-    # Remove from claude CLI registry (Claude Code CLI >=2.x)
-    claude_cli = shutil.which("claude")
-    if claude_cli:
-        check = subprocess.run(
-            [claude_cli, "mcp", "get", "headroom"],
-            capture_output=True,
-        )
-        if check.returncode == 0:
-            rm = subprocess.run(
-                [claude_cli, "mcp", "remove", "headroom", "-s", "user"],
-                capture_output=True,
-                text=True,
-            )
-            if rm.returncode == 0:
-                click.echo("✓ Headroom MCP server removed (via claude mcp remove)")
-                removed = True
-            else:
-                click.echo(
-                    f"Warning: 'claude mcp remove' failed ({rm.stderr.strip()}).",
-                    err=True,
-                )
-
-    # Also remove codebase-memory-mcp if registered (installed by --code-graph)
-    if claude_cli:
-        cbm_check = subprocess.run(
-            [claude_cli, "mcp", "get", "codebase-memory-mcp"],
-            capture_output=True,
-        )
-        if cbm_check.returncode == 0:
-            cbm_rm = subprocess.run(
-                [claude_cli, "mcp", "remove", "codebase-memory-mcp", "-s", "user"],
-                capture_output=True,
-                text=True,
-            )
-            if cbm_rm.returncode == 0:
-                click.echo("✓ codebase-memory-mcp MCP server removed")
-                removed = True
-
-    # Also remove from mcp.json fallback config if present
-    if MCP_CONFIG_PATH.exists():
-        config = load_mcp_config()
-        changed = False
+    for registrar in registrars:
+        if not registrar.detect():
+            continue
+        removed_names: list[str] = []
         for server_name in ("headroom", "codebase-memory-mcp"):
-            if server_name in config.get("mcpServers", {}):
-                del config["mcpServers"][server_name]
-                changed = True
-        if changed:
-            save_mcp_config(config)
-            click.echo(f"✓ MCP servers removed from {MCP_CONFIG_PATH}")
+            if registrar.unregister_server(server_name):
+                removed_names.append(server_name)
+        if removed_names:
+            click.echo(
+                f"✓ {registrar.display_name}: removed {', '.join(removed_names)} MCP server(s)"
+            )
             removed = True
 
     if not removed:
-        if MCP_CONFIG_PATH.exists():
-            click.echo("Headroom MCP is not configured. Nothing to uninstall.")
-        else:
-            click.echo("No MCP config found. Nothing to uninstall.")
+        click.echo("Headroom MCP is not configured. Nothing to uninstall.")
+
+
+@mcp.command("reconcile")
+@click.option("--adopt", is_flag=True, help="Replace only the Serena entry with Headroom's spec.")
+def mcp_reconcile(adopt: bool) -> None:
+    """Inspect or explicitly reconcile a user-managed Serena MCP entry."""
+    from headroom.mcp_registry import (
+        CLAUDE_SERENA_CONTEXT,
+        ClaudeConfigMutationError,
+        ClaudeRegistrar,
+        RegisterStatus,
+        build_serena_spec,
+    )
+    from headroom.mcp_registry.ledger import (
+        LedgerMutationError,
+        record_install,
+        validate_ledger_for_mutation,
+    )
+
+    registrar = ClaudeRegistrar()
+    if not registrar.detect():
+        raise click.ClickException("claude is not detected")
+    recommended = build_serena_spec(CLAUDE_SERENA_CONTEXT)
+    observed = registrar.get_server("serena")
+
+    if adopt:
+        try:
+            registrar.validate_configs_for_mutation()
+            validate_ledger_for_mutation()
+        except (ClaudeConfigMutationError, LedgerMutationError) as exc:
+            raise click.ClickException(str(exc)) from exc
+    if adopt:
+        result = registrar.register_server(recommended, force=True)
+        if result.status not in (RegisterStatus.REGISTERED, RegisterStatus.ALREADY):
+            raise click.ClickException(result.detail or "could not adopt Serena configuration")
+        record_install("claude", recommended)
+        click.echo(
+            "Adopted Headroom's Serena configuration for Claude; unrelated config preserved."
+        )
+        return
+
+    click.echo("Serena reconciliation for Claude")
+    click.echo(f"  observed: {'absent' if observed is None else 'present'}")
+    click.echo(f"  recommendation: {recommended.command} {' '.join(recommended.args)}")
+    if observed is not None and observed != recommended:
+        click.echo("  action: use --adopt to replace it")
+    # A Serena bundled by an enabled Claude Code plugin runs alongside the
+    # entry above (``claude mcp list`` shows it as ``plugin:serena:serena``)
+    # with none of Headroom's flags. It is a third-party plugin, so it is
+    # never removed here — point at the command that disables it (#3570).
+    for plugin_id, spec in registrar.get_plugin_servers("serena"):
+        click.echo(
+            f"  plugin: {plugin_id} also provides a Serena MCP server "
+            f"({spec.command} {' '.join(spec.args)})"
+        )
+        click.echo(
+            f"  action: disable it so only one Serena runs: claude plugin disable {plugin_id}"
+        )
 
 
 @mcp.command("status")
@@ -247,32 +252,30 @@ def mcp_status() -> None:
         click.echo("MCP SDK:        ✗ Not installed")
         click.echo("                pip install 'headroom-ai[mcp]'")
 
-    # Check config
-    if MCP_CONFIG_PATH.exists():
-        config = load_mcp_config()
-        if "headroom" in config.get("mcpServers", {}):
-            server_config = config["mcpServers"]["headroom"]
-            click.echo("Claude Config:  ✓ Configured")
-            click.echo(f"                {MCP_CONFIG_PATH}")
+    from headroom.mcp_registry import get_all_registrars
 
-            # Show proxy URL
-            env = server_config.get("env", {})
-            proxy_url = env.get("HEADROOM_PROXY_URL", DEFAULT_PROXY_URL)
-            click.echo(f"Proxy URL:      {proxy_url}")
-        else:
-            click.echo("Claude Config:  ✗ Not configured")
-            click.echo("                Run: headroom mcp install")
-    else:
-        click.echo("Claude Config:  ✗ No config file")
+    proxy_url = DEFAULT_PROXY_URL
+    any_configured = False
+    click.echo("Agent Config:")
+    for registrar in get_all_registrars():
+        if not registrar.detect():
+            click.echo(f"  {registrar.display_name}: ✗ Not detected")
+            continue
+        spec = registrar.get_server("headroom")
+        if spec is None:
+            click.echo(f"  {registrar.display_name}: ✗ Not configured")
+            continue
+        any_configured = True
+        proxy_url = spec.env.get("HEADROOM_PROXY_URL", proxy_url)
+        click.echo(f"  {registrar.display_name}: ✓ Configured")
+
+    if not any_configured:
         click.echo("                Run: headroom mcp install")
+    click.echo(f"Proxy URL:      {proxy_url}")
 
     # Check proxy connectivity
     try:
         import httpx
-
-        config = load_mcp_config()
-        env = config.get("mcpServers", {}).get("headroom", {}).get("env", {})
-        proxy_url = env.get("HEADROOM_PROXY_URL", DEFAULT_PROXY_URL)
 
         try:
             response = httpx.get(f"{proxy_url}/health", timeout=2.0)
@@ -285,6 +288,10 @@ def mcp_status() -> None:
             click.echo("                Run: headroom proxy")
         except httpx.TimeoutException:
             click.echo("Proxy Status:   ✗ Timeout")
+        except httpx.HTTPError as e:
+            # Catch the rest (InvalidURL, UnsupportedProtocol, ProtocolError, …)
+            # so a malformed configured HEADROOM_PROXY_URL can't crash `status`.
+            click.echo(f"Proxy Status:   ✗ Unreachable ({proxy_url}: {e})")
     except ImportError:
         click.echo("Proxy Status:   ? (httpx not installed)")
 
@@ -297,6 +304,32 @@ def mcp_status() -> None:
     help=f"Headroom proxy URL (default: {DEFAULT_PROXY_URL})",
 )
 @click.option(
+    "--transport",
+    type=click.Choice(["stdio", "http"], case_sensitive=False),
+    default="stdio",
+    show_default=True,
+    help="Transport to use for headroom mcp serve",
+)
+@click.option(
+    "--host",
+    default=DEFAULT_HTTP_HOST,
+    show_default=True,
+    help="HTTP bind host",
+)
+@click.option(
+    "--port",
+    default=DEFAULT_HTTP_PORT,
+    show_default=True,
+    type=int,
+    help="HTTP bind port",
+)
+@click.option(
+    "--path",
+    default=DEFAULT_HTTP_PATH,
+    show_default=True,
+    help="HTTP endpoint path",
+)
+@click.option(
     "--direct",
     is_flag=True,
     help="(Deprecated, ignored) Direct CompressionStore access is no longer supported",
@@ -306,16 +339,26 @@ def mcp_status() -> None:
     is_flag=True,
     help="Enable debug logging",
 )
-def mcp_serve(proxy_url: str | None, direct: bool, debug: bool) -> None:
+def mcp_serve(
+    proxy_url: str | None,
+    transport: str,
+    host: str,
+    port: int,
+    path: str,
+    direct: bool,
+    debug: bool,
+) -> None:
     """Start the MCP server (called by Claude Code).
 
     \b
     This command is typically invoked by Claude Code via the MCP config,
-    not run directly. It starts the MCP server with stdio transport.
+    not run directly. It starts the MCP server with stdio by default or
+    Streamable HTTP when requested.
 
     \b
     For manual testing:
         headroom mcp serve --debug
+        headroom mcp serve --transport http --host 127.0.0.1 --port 8788 --path /mcp
     """
     import asyncio
     import logging
@@ -340,6 +383,8 @@ def mcp_serve(proxy_url: str | None, direct: bool, debug: bool) -> None:
             format="%(levelname)s: %(message)s",
         )
 
+    transport = transport.lower()
+
     # Use default if not specified
     effective_proxy_url = proxy_url or DEFAULT_PROXY_URL
 
@@ -353,7 +398,10 @@ def mcp_serve(proxy_url: str | None, direct: bool, debug: bool) -> None:
 
     async def run() -> None:
         try:
-            await server.run_stdio()
+            if transport == "http":
+                await server.run_streamable_http(host=host, port=port, path=path, debug=debug)
+            else:
+                await server.run_stdio()
         finally:
             await server.cleanup()
 

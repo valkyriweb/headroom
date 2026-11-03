@@ -5,12 +5,13 @@ Reads conversation logs from ~/.claude/projects/ (JSONL format).
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import re
 from pathlib import Path, PureWindowsPath
 
-from .._shared import classify_error, is_error_content
+from .._shared import classify_error, claude_config_dir, is_error_content
 from ..base import ConversationScanner, LearnPlugin
 from ..models import (
     ErrorCategory,
@@ -20,6 +21,7 @@ from ..models import (
     ToolCall,
 )
 from ..writer import ClaudeCodeWriter, ContextWriter
+from ._paths import path_exists as _path_exists
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +35,7 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
     """
 
     def __init__(self, claude_dir: Path | None = None):
-        self.claude_dir = claude_dir or Path.home() / ".claude"
+        self.claude_dir = claude_dir or claude_config_dir()
         self.projects_dir = self.claude_dir / "projects"
 
     # --- LearnPlugin identity ---
@@ -70,29 +72,39 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
 
             project_path = _decode_project_path(entry.name)
             if project_path is None:
-                fallback_parts = entry.name[1:].split("-")
-                if len(fallback_parts[0]) == 1 and fallback_parts[0].isalpha():
-                    drive = fallback_parts[0].upper()
-                    project_path = Path(f"{drive}:\\" + "\\".join(fallback_parts[1:]))
+                win = re.match(r"^-?([A-Za-z])--?(.+)$", entry.name)
+                if win:
+                    drive = win.group(1).upper()
+                    tokens = [p for p in win.group(2).split("-") if p]
+                    project_path = Path(f"{drive}:\\" + "\\".join(tokens))
                 else:
-                    project_path = Path("/" + entry.name[1:].replace("-", "/"))
+                    stripped = entry.name.lstrip("-")
+                    project_path = Path("/" + stripped.replace("-", "/"))
 
             name = _project_display_name(project_path, entry.name)
 
             context_file = None
-            if project_path.exists():
+            if _path_exists(project_path):
                 claude_md = project_path / "CLAUDE.md"
-                if claude_md.exists():
+                if _path_exists(claude_md):
                     context_file = claude_md
 
+            # `entry` itself stats fine (its parent is ours) but a project dir
+            # left behind by a root-run session is not traversable, so stat-ing
+            # anything under it raises PermissionError. Treat that as absent.
             memory_dir = entry / "memory"
-            memory_file = memory_dir / "MEMORY.md" if memory_dir.exists() else None
-            if memory_file and not memory_file.exists():
+            memory_file = memory_dir / "MEMORY.md" if _path_exists(memory_dir) else None
+            if memory_file and not _path_exists(memory_file):
                 memory_file = None
 
             jsonl_files = list(entry.glob("*.jsonl"))
             if not jsonl_files:
                 continue
+
+            session_project_path = self._project_path_from_session_cwd(jsonl_files)
+            if session_project_path is not None:
+                project_path = session_project_path
+                name = _project_display_name(project_path, entry.name)
 
             projects.append(
                 ProjectInfo(
@@ -104,7 +116,91 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
                 )
             )
 
-        return projects
+        return self._merge_worktrees(projects)
+
+    def _merge_worktrees(self, projects: list[ProjectInfo]) -> list[ProjectInfo]:
+        """Fold each linked git worktree into the project of its main checkout.
+
+        Claude Code files every working directory's sessions under its own
+        folder, so each worktree (a Conductor workspace, ``.claude/worktrees/*``)
+        would otherwise be its own project: a handful of sessions, too thin to
+        cross a pattern threshold, with learnings written into a checkout that
+        is deleted with the workspace. The merged project keeps the main
+        checkout's path and memory folder, which Claude Code's auto-memory
+        shares across a repo's worktrees, and scans every member's sessions.
+        A worktree whose checkout is gone has nothing to resolve it from and
+        stays separate.
+        """
+        groups: dict[Path, list[tuple[ProjectInfo, Path | None]]] = {}
+        for project in projects:
+            root = _main_worktree_root(project.project_path)
+            try:
+                key = root or project.project_path.resolve()
+            except OSError:
+                key = project.project_path
+            groups.setdefault(key, []).append((project, root))
+
+        merged: list[ProjectInfo] = []
+        for key, members in groups.items():
+            if all(root is None for _, root in members):
+                merged.extend(project for project, _ in members)
+                continue
+            main = next((project for project, root in members if root is None), None)
+            # A repo worked on only through worktrees has no session folder of
+            # its own; use the one Claude Code would give its main checkout.
+            data_path = (
+                main.data_path
+                if main
+                else self.projects_dir / re.sub(r"[^A-Za-z0-9]", "-", str(key))
+            )
+            project_path = main.project_path if main else key
+            claude_md = project_path / "CLAUDE.md"
+            memory_file = data_path / "memory" / "MEMORY.md"
+            merged.append(
+                dataclasses.replace(
+                    main or members[0][0],
+                    name=_project_display_name(project_path, data_path.name),
+                    project_path=project_path,
+                    data_path=data_path,
+                    context_file=claude_md if _path_exists(claude_md) else None,
+                    memory_file=memory_file if _path_exists(memory_file) else None,
+                    # The session folder can be a subdirectory of the checkout;
+                    # record the checkout root too so selecting the worktree
+                    # itself, or a path elsewhere in it, still finds this project.
+                    worktree_paths=list(
+                        dict.fromkeys(
+                            path
+                            for p, root in members
+                            if root is not None
+                            for path in (p.project_path, _checkout_root(p.project_path))
+                            if path is not None
+                        )
+                    ),
+                    extra_data_paths=[p.data_path for p, _ in members if p is not main],
+                )
+            )
+        return merged
+
+    @staticmethod
+    def _project_path_from_session_cwd(jsonl_files: list[Path]) -> Path | None:
+        for jsonl_path in sorted(jsonl_files):
+            try:
+                with open(jsonl_path, encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        cwd = event.get("cwd")
+                        if isinstance(cwd, str) and cwd:
+                            project_path = Path(cwd)
+                            if project_path.exists():
+                                return project_path
+            except (OSError, UnicodeDecodeError):
+                continue
+        return None
 
     def scan_project(
         self, project: ProjectInfo, max_workers: int = 1, include_subagents: bool = True
@@ -118,15 +214,16 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
         by default we descend into them. Pass ``include_subagents=False`` to
         restrict to top-level main sessions only.
         """
-        data_path = project.data_path
-        if include_subagents:
-            jsonl_files = sorted(data_path.rglob("*.jsonl"))
-        else:
-            jsonl_files = sorted(data_path.glob("*.jsonl"))
-        if not jsonl_files:
+        file_sources: list[tuple[Path, str]] = []
+        for data_path in (project.data_path, *project.extra_data_paths):
+            if include_subagents:
+                jsonl_files = sorted(data_path.rglob("*.jsonl"))
+            else:
+                jsonl_files = sorted(data_path.glob("*.jsonl"))
+            file_sources.extend((f, self._classify_source(data_path, f)) for f in jsonl_files)
+        if not file_sources:
             return []
-
-        file_sources = [(f, self._classify_source(data_path, f)) for f in jsonl_files]
+        jsonl_files = [f for f, _ in file_sources]
 
         if max_workers <= 1 or len(jsonl_files) <= 1:
             return [
@@ -167,7 +264,7 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
         msg_index = 0
 
         try:
-            with open(jsonl_path) as f:
+            with open(jsonl_path, encoding="utf-8", errors="replace") as f:
                 for line in f:
                     try:
                         d = json.loads(line)
@@ -180,7 +277,12 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
 
                     if line_type == "assistant":
                         self._extract_tool_uses(d, tool_uses)
-                        usage = d.get("message", {}).get("usage", {})
+                        # `get("message", {})` returns None for an explicit
+                        # {"message": null} line (the default only applies to a
+                        # missing key); `.get` on None then raises AttributeError,
+                        # which the OSError/UnicodeDecodeError guard does not catch
+                        # — so one malformed line crashed the whole learn run.
+                        usage = (d.get("message") or {}).get("usage", {})
                         total_input_tokens += usage.get("input_tokens", 0)
                         total_input_tokens += usage.get("cache_read_input_tokens", 0)
                         total_input_tokens += usage.get("cache_creation_input_tokens", 0)
@@ -209,7 +311,7 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
 
     def _extract_tool_uses(self, d: dict, tool_uses: dict[str, tuple[str, dict]]) -> None:
         """Extract tool_use blocks from an assistant message."""
-        msg = d.get("message", {})
+        msg = d.get("message") or {}
         content = msg.get("content", [])
         if not isinstance(content, list):
             return
@@ -233,7 +335,7 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
         timestamp: str | None = None,
     ) -> None:
         """Extract tool_result blocks from a user message and match to tool_uses."""
-        msg = d.get("message", {})
+        msg = d.get("message") or {}
         content = msg.get("content", [])
         if not isinstance(content, list):
             return
@@ -299,7 +401,7 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
         timestamp: str | None = None,
     ) -> None:
         """Extract user text messages and interruptions from a user line."""
-        msg = d.get("message", {})
+        msg = d.get("message") or {}
         content = msg.get("content", "")
 
         if isinstance(content, str) and content.strip():
@@ -335,8 +437,41 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
 # =============================================================================
 
 
+def _decode_windows_path(drive: str, parts: list[str]) -> Path | None:
+    """Reconstruct a Windows path from drive letter + dash-split tokens.
+
+    Empty tokens (from consecutive dashes in the encoded name) are dropped so
+    the literal join never produces doubled separators.
+    """
+    tokens = [p for p in parts if p]
+    if not tokens:
+        return None
+    win_path = Path(f"{drive}:\\" + "\\".join(tokens))
+    if _path_exists(win_path):
+        return win_path
+    drive_root = Path(f"{drive}:\\")
+    if _path_exists(drive_root):
+        result = _greedy_path_decode(drive_root, tokens)
+        if result:
+            return result
+    if tokens[0].lower() == "users":
+        return win_path
+    return None
+
+
 def _decode_project_path(escaped_name: str) -> Path | None:
     """Decode a Claude Code escaped project path."""
+    # Windows paths are encoded without a leading dash: "C:\Users\x" becomes
+    # "C--Users-x" (":" and "\" each collapse to "-"). Older callers also pass
+    # the legacy "-C-Users-x" form; accept both.
+    win = re.match(r"^-?([A-Za-z])--?(.+)$", escaped_name)
+    if win:
+        result = _decode_windows_path(win.group(1).upper(), win.group(2).split("-"))
+        if result is not None:
+            return result
+        if not escaped_name.startswith("-"):
+            return None
+
     if not escaped_name.startswith("-"):
         return None
 
@@ -344,21 +479,8 @@ def _decode_project_path(escaped_name: str) -> Path | None:
     if len(parts) < 2:
         return None
 
-    if len(parts[0]) == 1 and parts[0].isalpha():
-        drive = parts[0].upper()
-        win_path = Path(f"{drive}:\\" + "\\".join(parts[1:]))
-        if win_path.exists():
-            return win_path
-        win_base = Path(f"{drive}:\\{parts[1]}") if len(parts) > 1 else win_path
-        if win_base.exists() and len(parts) > 2:
-            result = _greedy_path_decode(win_base, parts[2:])
-            if result:
-                return result
-        if len(parts) > 1 and parts[1].lower() == "users":
-            return win_path
-
     simple = Path("/" + escaped_name[1:].replace("-", "/"))
-    if simple.exists():
+    if _path_exists(simple):
         return simple
 
     if len(parts) < 3:
@@ -379,6 +501,41 @@ def _decode_project_path(escaped_name: str) -> Path | None:
     return None
 
 
+def _checkout_root(path: Path) -> Path | None:
+    """The nearest directory at or above ``path`` holding a ``.git`` entry."""
+    try:
+        return next((d for d in (path, *path.parents) if _path_exists(d / ".git")), None)
+    except OSError:
+        return None
+
+
+def _main_worktree_root(path: Path) -> Path | None:
+    """Return the main checkout of the linked git worktree ``path`` is in.
+
+    Returns None for a main checkout, a submodule, a bare repo, or anything
+    outside git. Reads git's own pointer files rather than running git.
+    """
+    # A relative path (a Windows path decoded on POSIX) would walk up into the
+    # process's working directory and match whatever repo that sits in.
+    if not path.is_absolute():
+        return None
+    try:
+        checkout = _checkout_root(path)
+        if checkout is None:
+            return None
+        # A main checkout's .git is a directory, so this read fails there.
+        pointer = (checkout / ".git").read_text(encoding="utf-8").strip()
+        if not pointer.startswith("gitdir:"):
+            return None
+        gitdir = checkout / pointer[len("gitdir:") :].strip()
+        # Only a linked worktree's gitdir has `commondir` (a submodule's does not).
+        common = (gitdir / (gitdir / "commondir").read_text(encoding="utf-8").strip()).resolve()
+    except (OSError, UnicodeDecodeError):
+        return None
+    # A bare repo has no checkout to merge into.
+    return common.parent if common.name == ".git" else None
+
+
 def _project_display_name(project_path: Path, fallback: str) -> str:
     """Return a human project name for POSIX and Windows-style decoded paths."""
     rendered = str(project_path)
@@ -392,15 +549,29 @@ def _project_display_name(project_path: Path, fallback: str) -> str:
 def _greedy_path_decode(base: Path, parts: list[str]) -> Path | None:
     """Greedily decode remaining path parts using real child directories."""
     if not parts:
-        return base if base.exists() else None
+        return base if _path_exists(base) else None
 
-    if not base.exists() or not base.is_dir():
+    if not _path_exists(base) or not base.is_dir():
         return None
 
     try:
-        children = sorted(child for child in base.iterdir() if child.is_dir())
+        entries = list(base.iterdir())
     except OSError:
         return None
+
+    # Windows profiles routinely contain reparse-point junctions (e.g.
+    # "AppData\Local\Temporary Internet Files") that raise PermissionError on
+    # is_dir(). Skip those entries individually instead of letting one
+    # inaccessible sibling abort the whole listing — and thus every project
+    # path that happens to walk through this directory.
+    children = []
+    for entry in entries:
+        try:
+            if entry.is_dir():
+                children.append(entry)
+        except OSError:
+            continue
+    children.sort()
 
     for child in children:
         for tokenization in _component_tokenizations(child.name):

@@ -76,7 +76,7 @@ class TestAllSeenInstancesUnboundedGrowth:
         # Simulate adding users via record_compression
         # (the cap is enforced there, not when directly adding to set)
         pattern = ToolPattern(tool_signature_hash=sig.structure_hash)
-        toin._patterns[("unknown", "unknown", sig.structure_hash)] = pattern
+        toin._patterns[("global", "unknown", "unknown", sig.structure_hash)] = pattern
 
         # Direct manipulation should still work for testing
         for i in range(200):
@@ -101,7 +101,7 @@ class TestAllSeenInstancesUnboundedGrowth:
         # Record compressions from 150 "users" (simulated)
         # by directly manipulating the pattern
         pattern = ToolPattern(tool_signature_hash=sig.structure_hash)
-        toin._patterns[("unknown", "unknown", sig.structure_hash)] = pattern
+        toin._patterns[("global", "unknown", "unknown", sig.structure_hash)] = pattern
 
         # Track 150 unique users
         for i in range(150):
@@ -183,7 +183,7 @@ class TestAllSeenInstancesSerialization:
             )
 
             # Manually add more users to simulate multi-user scenario
-            pattern = toin._patterns[("unknown", "unknown", sig.structure_hash)]
+            pattern = toin._patterns[("global", "unknown", "unknown", sig.structure_hash)]
             for i in range(50):
                 instance_hash = hashlib.sha256(f"extra_user_{i}".encode()).hexdigest()[:8]
                 if instance_hash not in pattern._all_seen_instances:
@@ -202,7 +202,7 @@ class TestAllSeenInstancesSerialization:
             toin2 = ToolIntelligenceNetwork(config)
 
             # Verify user count is preserved
-            pattern2 = toin2._patterns.get(("unknown", "unknown", sig.structure_hash))
+            pattern2 = toin2._patterns.get(("global", "unknown", "unknown", sig.structure_hash))
             assert pattern2 is not None
             assert pattern2.user_count == original_user_count
 
@@ -252,7 +252,7 @@ class TestUserCountMergeLogic:
         imported.sample_size = 5
 
         # Merge
-        toin._patterns[("unknown", "unknown", "test_hash")] = existing
+        toin._patterns[("global", "unknown", "unknown", "test_hash")] = existing
         toin._merge_patterns(existing, imported)
 
         # After merge: 5 existing + 2 new = 7 unique users
@@ -287,7 +287,7 @@ class TestUserCountMergeLogic:
         imported.sample_size = 20
 
         # Merge
-        toin._patterns[("unknown", "unknown", "test_hash")] = existing
+        toin._patterns[("global", "unknown", "unknown", "test_hash")] = existing
         toin._merge_patterns(existing, imported)
 
         # After merge: 120 existing + 10 new = 130 unique users
@@ -295,12 +295,12 @@ class TestUserCountMergeLogic:
 
 
 # =============================================================================
-# CRITICAL #4: _get_entry_for_search returns reference not copy
+# CRITICAL #4: retrieve() returns reference not copy
 # =============================================================================
 
 
-class TestGetEntryForSearchRaceCondition:
-    """CRITICAL: _get_entry_for_search returns reference to internal entry.
+class TestRetrieveRaceCondition:
+    """CRITICAL: retrieve() must not return a reference to the internal entry.
 
     The entry can be modified or evicted by another thread after the lock
     is released but before the caller uses it, causing race conditions.
@@ -321,8 +321,8 @@ class TestGetEntryForSearchRaceCondition:
             tool_name="test_tool",
         )
 
-        # Get entry via _get_entry_for_search
-        entry1 = store._get_entry_for_search(hash_key)
+        # Get entry via retrieve()
+        entry1 = store.retrieve(hash_key)
         assert entry1 is not None
 
         # Modify the returned entry
@@ -330,7 +330,7 @@ class TestGetEntryForSearchRaceCondition:
         entry1.retrieval_count = 999
 
         # Get entry again - should NOT reflect our modifications
-        entry2 = store._get_entry_for_search(hash_key)
+        entry2 = store.retrieve(hash_key)
 
         # AFTER FIX: entry2 should be a fresh copy, not affected by entry1 modifications
         # Currently this may fail because we return a reference
@@ -354,7 +354,7 @@ class TestGetEntryForSearchRaceCondition:
 
         def reader():
             for _ in range(50):
-                entry = store._get_entry_for_search(hash_key, "query")
+                entry = store.retrieve(hash_key)
                 if entry:
                     # Simulate work with the entry
                     try:
@@ -368,7 +368,7 @@ class TestGetEntryForSearchRaceCondition:
         def modifier():
             for _ in range(50):
                 # Try to mess with internal state
-                entry = store._get_entry_for_search(hash_key)
+                entry = store.retrieve(hash_key)
                 if entry:
                     entry.search_queries.clear()  # Shouldn't affect other readers
                 time.sleep(0.001)
@@ -677,19 +677,15 @@ class TestCriticalFixesIntegration:
             strategy="TOP_N",
         )
 
-        # 4. Simulate retrieval
+        # 4. Simulate retrieval (by hash — returns the full original content)
         entry = store.retrieve(hash_key)
         assert entry is not None
         assert entry.original_item_count == 100
 
-        # 5. Search within cached data
-        store.search(hash_key, "item_50")
-        # Should find the item even though it was compressed away
-
-        # 6. Get recommendation from TOIN
+        # 5. Get recommendation from TOIN
         toin.get_recommendation(sig, "find item_50")
 
-        # 7. Verify stats are consistent
+        # 6. Verify stats are consistent
         toin_stats = toin.get_stats()
         store_stats = store.get_stats()
         feedback_stats = feedback.get_stats()
@@ -732,7 +728,7 @@ class TestTOINHighPriorityFixes:
                 query_fields=[f"unique_field_{i}"],
             )
 
-        pattern = toin._patterns[("unknown", "unknown", sig.structure_hash)]
+        pattern = toin._patterns[("global", "unknown", "unknown", sig.structure_hash)]
         assert len(pattern.field_retrieval_frequency) <= 100
 
     def test_commonly_retrieved_fields_bounded(self):
@@ -761,7 +757,7 @@ class TestTOINHighPriorityFixes:
                     query_fields=[f"common_field_{i}"],
                 )
 
-        pattern = toin._patterns[("unknown", "unknown", sig.structure_hash)]
+        pattern = toin._patterns[("global", "unknown", "unknown", sig.structure_hash)]
         assert len(pattern.commonly_retrieved_fields) <= 20
 
     def test_strategy_success_rate_updates(self):
@@ -782,7 +778,7 @@ class TestTOINHighPriorityFixes:
             strategy="TEST_STRATEGY",
         )
 
-        pattern = toin._patterns[("unknown", "unknown", sig.structure_hash)]
+        pattern = toin._patterns[("global", "unknown", "unknown", sig.structure_hash)]
         initial_rate = pattern.strategy_success_rates["TEST_STRATEGY"]
         assert initial_rate == 1.0  # Starts at 1.0
 
@@ -794,7 +790,7 @@ class TestTOINHighPriorityFixes:
             strategy="TEST_STRATEGY",
         )
 
-        pattern = toin._patterns[("unknown", "unknown", sig.structure_hash)]
+        pattern = toin._patterns[("global", "unknown", "unknown", sig.structure_hash)]
         after_retrieval = pattern.strategy_success_rates["TEST_STRATEGY"]
         assert after_retrieval < initial_rate  # Should decrease
 
@@ -809,7 +805,7 @@ class TestTOINHighPriorityFixes:
                 strategy="TEST_STRATEGY",
             )
 
-        pattern = toin._patterns[("unknown", "unknown", sig.structure_hash)]
+        pattern = toin._patterns[("global", "unknown", "unknown", sig.structure_hash)]
         after_compressions = pattern.strategy_success_rates["TEST_STRATEGY"]
         assert after_compressions > after_retrieval  # Should increase
 
@@ -848,12 +844,6 @@ class TestTOINHighPriorityFixes:
             # After auto-save, dirty should be cleared
             # (auto-save happens inside record_compression)
             assert not toin._dirty
-
-    @pytest.mark.skip(
-        reason="PR-B5: get_recommendation retired; preserve_fields lives on the aggregated ToolPattern instead"
-    )
-    def test_toin_preserves_fields_returns_list(self):
-        """Retired in PR-B5 along with the request-time hint API."""
 
 
 class TestCompressionStoreHighPriorityFixes:
@@ -925,9 +915,10 @@ class TestCompressionStoreHighPriorityFixes:
             compressed='[{"id": 1}]',
         )
 
-        # Trigger many searches with different queries
+        # Trigger many retrievals with different queries (query is recorded
+        # for access tracking even though retrieval itself is by hash).
         for i in range(50):
-            store.search(hash_key, f"unique_query_{i}")
+            store.retrieve(hash_key, query=f"unique_query_{i}")
 
         with store._lock:
             entry = store._backend.get(hash_key)

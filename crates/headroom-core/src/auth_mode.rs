@@ -153,25 +153,22 @@ fn has_chatgpt_codex_subscription_hint(headers: &HeaderMap) -> bool {
 /// 1. **Subscription UA prefix** → [`AuthMode::Subscription`].
 ///    The CLI's own auth-mode wins over the bearer token shape it
 ///    happens to be carrying — a Claude Code session uses a
-///    `sk-ant-oat-*` token but is a subscription client, not OAuth.
-/// 2. **ChatGPT/Codex account header or JWT claim** →
-///    [`AuthMode::Subscription`] (Codex CLI / Pi Codex subscription auth).
-/// 3. **`Authorization: Bearer sk-ant-oat-*`** → [`AuthMode::OAuth`]
+///    `sk-ant-oat*` token but is a subscription client, not OAuth.
+/// 2. **`Authorization: Bearer sk-ant-oat*`** → [`AuthMode::OAuth`]
 ///    (Claude Pro / Max OAuth). Checked before the broader `sk-` PAYG
-///    rule because `sk-ant-oat-` shares the `sk-` prefix.
-/// 4. **`Authorization: Bearer sk-ant-api*` or `Bearer sk-*`** →
+///    rule because `sk-ant-oat` shares the `sk-` prefix.
+/// 3. **`Authorization: Bearer sk-ant-api*` or `Bearer sk-*`** →
 ///    [`AuthMode::Payg`] (Anthropic / OpenAI API key).
-/// 5. **`Authorization: Bearer <jwt>`** (3 dot-separated segments) →
-///    [`AuthMode::OAuth`] (Cursor / Copilot OAuth, unless it has the
-///    ChatGPT/Codex subscription claim handled above).
-/// 6. **`Authorization` present but not `Bearer ...`** →
+/// 4. **`Authorization: Bearer <jwt>`** (3 dot-separated segments) →
+///    [`AuthMode::OAuth`] (Codex / Cursor / Copilot OAuth).
+/// 5. **`Authorization` present but not `Bearer ...`** →
 ///    [`AuthMode::OAuth`] (AWS SigV4 `AWS4-HMAC-SHA256 ...` →
 ///    Bedrock; any other non-Bearer scheme is presumed
 ///    passthrough-prefer too).
-/// 7. **`x-api-key` present** → [`AuthMode::Payg`] (Anthropic API key
+/// 6. **`x-api-key` present** → [`AuthMode::Payg`] (Anthropic API key
 ///    style).
-/// 8. **`x-goog-api-key` present** → [`AuthMode::Payg`] (Gemini key).
-/// 9. **Default** → [`AuthMode::Payg`] (safest default; aggressive
+/// 7. **`x-goog-api-key` present** → [`AuthMode::Payg`] (Gemini key).
+/// 8. **Default** → [`AuthMode::Payg`] (safest default; aggressive
 ///    compression on a misclassified request just costs us a re-run,
 ///    not a revoked subscription).
 ///
@@ -234,10 +231,11 @@ pub fn classify(headers: &HeaderMap) -> AuthMode {
     };
 
     if let Some(token) = auth.strip_prefix("Bearer ") {
-        // Order matters: the OAuth shape `sk-ant-oat-*` shares a
+        // Order matters: the OAuth shape `sk-ant-oat*` shares a
         // prefix with `sk-ant-api*` only at `sk-ant-`, so we check
-        // the OAuth shape FIRST. Then the broad PAYG shapes.
-        if token.starts_with("sk-ant-oat-") {
+        // the OAuth shape FIRST. Real OAuth access tokens are
+        // `sk-ant-oat01-...` (version number, no dash after `oat`).
+        if token.starts_with("sk-ant-oat") {
             return AuthMode::OAuth;
         }
         if token.starts_with("sk-ant-api") || token.starts_with("sk-") {

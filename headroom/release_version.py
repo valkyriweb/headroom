@@ -9,6 +9,29 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+# Load the UTF-8-forcing subprocess wrapper WITHOUT importing the `headroom`
+# package. The release workflow runs this file as a bare script
+# (`python headroom/release_version.py`), where `sys.path[0]` is `headroom/`
+# rather than the repo root, so `from headroom._subprocess import run` fails
+# with `ModuleNotFoundError: No module named 'headroom'` — and even when it
+# resolves, it drags in `headroom/__init__.py` (the Rust `_core` import), which
+# isn't built in the detect-version job (issue #1328). Loading `_subprocess.py`
+# by path sidesteps both while still routing every text-mode git call through
+# the shared wrapper (keeps the `test_text_mode_subprocess_calls_use_wrapper`
+# guard happy — no raw `subprocess.run(..., text=True)` here).
+try:  # normal package context (tests import `headroom.release_version`)
+    from headroom._subprocess import run
+except ModuleNotFoundError:  # bare-script context (the release workflow)
+    import importlib.util as _ilu
+
+    _spec = _ilu.spec_from_file_location(
+        "_headroom_subprocess", Path(__file__).resolve().parent / "_subprocess.py"
+    )
+    assert _spec and _spec.loader  # for type checkers; spec is always present here
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    run = _mod.run
+
 SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 RELEASE_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?$")
 CONVENTIONAL_COMMIT_RE = re.compile(
@@ -207,10 +230,7 @@ def compute_release_version(
 def get_canonical_version(root: Path) -> str:
     """Read the canonical project version from pyproject.toml."""
 
-    try:
-        import tomllib
-    except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
-        import tomli as tomllib
+    import tomllib
 
     with open(root / "pyproject.toml", "rb") as file:
         project = tomllib.load(file)["project"]
@@ -220,12 +240,14 @@ def get_canonical_version(root: Path) -> str:
 def list_release_tags(root: Path) -> list[str]:
     """List release tags from the local Git checkout."""
 
-    result = subprocess.run(
+    result = run(
         ["git", "tag", "-l", "v*"],
         cwd=root,
         check=True,
         capture_output=True,
         text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=10,
     )
     return [tag.strip() for tag in result.stdout.splitlines() if tag.strip()]
 
@@ -239,12 +261,14 @@ def list_release_commits(root: Path, previous_tag: str) -> list[CommitInfo]:
     else:
         cmd.append("HEAD")
 
-    result = subprocess.run(
+    result = run(
         cmd,
         cwd=root,
         check=True,
         capture_output=True,
         text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=10,
     )
 
     commits: list[CommitInfo] = []
@@ -262,12 +286,14 @@ def commit_height_since(root: Path, previous_tag: str) -> str:
     if not previous_tag:
         return "0"
 
-    result = subprocess.run(
+    result = run(
         ["git", "rev-list", f"{previous_tag}..HEAD", "--count"],
         cwd=root,
         check=True,
         capture_output=True,
         text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=10,
     )
     return result.stdout.strip() or "0"
 
@@ -283,9 +309,49 @@ def write_github_outputs(info: ReleaseVersionInfo, output_path: str) -> None:
 def main() -> None:
     root = Path.cwd()
     manual_version = os.environ.get("MANUAL_VER", "").strip()
+    manual_raw = os.environ.get("MANUAL_VER") or os.environ.get("LEVEL") or "patch"
+    manual_match = re.fullmatch(
+        r"v?(\d+\.\d+\.\d+(?:[abrc]\d+)?)",
+        manual_raw.strip(),
+    )
+    if manual_match:
+        version = manual_match.group(1)
+        info = ReleaseVersionInfo(
+            version=version,
+            npm_version=version,
+            canonical=get_canonical_version(root),
+            bump="manual",
+            height="0",
+            previous_tag="",
+        )
+        output_path = os.environ.get("GITHUB_OUTPUT")
+        if output_path:
+            write_github_outputs(info, output_path)
+        print(f"version={info.version}")
+        print(f"npm_version={info.npm_version}")
+        print(f"height={info.height}")
+        return
     tags = list_release_tags(root)
     previous_tag = find_latest_release_tag(tags) or ""
     level = os.environ.get("LEVEL", "").strip()
+    manual_match = re.fullmatch(r"v?(\d+\.\d+\.\d+(?:[abrc]\d+)?)", level.strip())
+    if manual_match:
+        version = manual_match.group(1)
+        info = ReleaseVersionInfo(
+            version=version,
+            npm_version=version,
+            canonical=get_canonical_version(root),
+            bump="manual",
+            height="0",
+            previous_tag="",
+        )
+        output_path = os.environ.get("GITHUB_OUTPUT")
+        if output_path:
+            write_github_outputs(info, output_path)
+        print(f"version={info.version}")
+        print(f"npm_version={info.npm_version}")
+        print(f"height={info.height}")
+        return
     if not level:
         level = determine_bump_level(list_release_commits(root, previous_tag))
 

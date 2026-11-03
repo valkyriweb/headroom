@@ -28,10 +28,14 @@ Custom:
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 from headroom.evals.core import EvalCase, EvalSuite
+from headroom.offline import guard_egress, is_offline
+
+logger = logging.getLogger(__name__)
 
 
 def _check_datasets_installed() -> None:
@@ -43,6 +47,36 @@ def _check_datasets_installed() -> None:
             "HuggingFace datasets required for this loader. "
             "Install with: pip install headroom-ai[evals]"
         ) from e
+
+
+def load_hf_dataset(path: str, *args: Any, **kwargs: Any) -> Any:
+    """``datasets.load_dataset``, cache first under ``HEADROOM_OFFLINE``.
+
+    ``load_dataset`` takes no ``local_files_only``, and with an explicit
+    ``HF_HUB_OFFLINE=0`` it fetches from the Hub even when ``HEADROOM_OFFLINE``
+    is set. So, as ``relevance/embedding._load_text_embedding`` does for
+    fastembed: under the switch, try the load with the datasets and
+    huggingface_hub offline constants forced on (a pre-seeded cache still
+    loads), and only on a miss reach :func:`guard_egress`, which refuses
+    before any remote attempt. Online, nothing changes.
+    """
+    from datasets import load_dataset
+
+    if is_offline():
+        import datasets.config as datasets_config
+        from huggingface_hub import constants as hf_constants
+
+        previous = (datasets_config.HF_HUB_OFFLINE, hf_constants.HF_HUB_OFFLINE)
+        datasets_config.HF_HUB_OFFLINE = True
+        hf_constants.HF_HUB_OFFLINE = True
+        try:
+            return load_dataset(path, *args, **kwargs)
+        except Exception as cache_miss:  # noqa: BLE001 - any local-lookup failure
+            logger.debug("eval dataset %s not in the local cache: %s", path, cache_miss)
+        finally:
+            datasets_config.HF_HUB_OFFLINE, hf_constants.HF_HUB_OFFLINE = previous
+    guard_egress(f"HuggingFace eval-dataset download ({path})", "huggingface.co")
+    return load_dataset(path, *args, **kwargs)
 
 
 # =============================================================================
@@ -69,9 +103,8 @@ def load_hotpotqa(
         EvalSuite with HotpotQA cases
     """
     _check_datasets_installed()
-    from datasets import load_dataset
 
-    ds = load_dataset("hotpotqa/hotpot_qa", "fullwiki", split=split)
+    ds = load_hf_dataset("hotpotqa/hotpot_qa", "fullwiki", split=split)
 
     cases: list[EvalCase] = []
     for i, item in enumerate(ds):
@@ -121,9 +154,8 @@ def load_natural_questions(
         EvalSuite with Natural Questions cases
     """
     _check_datasets_installed()
-    from datasets import load_dataset
 
-    ds = load_dataset("google-research-datasets/natural_questions", "default", split=split)
+    ds = load_hf_dataset("google-research-datasets/natural_questions", "default", split=split)
 
     cases: list[EvalCase] = []
     for i, item in enumerate(ds):
@@ -198,9 +230,8 @@ def load_triviaqa(
         EvalSuite with TriviaQA cases
     """
     _check_datasets_installed()
-    from datasets import load_dataset
 
-    ds = load_dataset("trivia_qa", subset, split=split)
+    ds = load_hf_dataset("trivia_qa", subset, split=split)
 
     cases: list[EvalCase] = []
     for i, item in enumerate(ds):
@@ -269,9 +300,8 @@ def load_msmarco(
         EvalSuite with MS MARCO cases
     """
     _check_datasets_installed()
-    from datasets import load_dataset
 
-    ds = load_dataset("microsoft/ms_marco", "v2.1", split=split)
+    ds = load_hf_dataset("microsoft/ms_marco", "v2.1", split=split)
 
     cases: list[EvalCase] = []
     for i, item in enumerate(ds):
@@ -337,9 +367,8 @@ def load_squad(
         EvalSuite with SQuAD cases
     """
     _check_datasets_installed()
-    from datasets import load_dataset
 
-    ds = load_dataset("rajpurkar/squad_v2", split=split)
+    ds = load_hf_dataset("rajpurkar/squad_v2", split=split)
 
     cases: list[EvalCase] = []
     for i, item in enumerate(ds):
@@ -398,10 +427,9 @@ def load_longbench(
         EvalSuite with LongBench cases
     """
     _check_datasets_installed()
-    from datasets import load_dataset
 
     try:
-        ds = load_dataset("THUDM/LongBench", task, split="test")
+        ds = load_hf_dataset("THUDM/LongBench", task, split="test")
     except Exception as e:
         raise ValueError(f"Failed to load LongBench task '{task}': {e}") from e
 
@@ -439,6 +467,60 @@ def load_longbench(
     return EvalSuite(name=f"LongBench_{task}", cases=cases)
 
 
+def load_multi_wiki_qa(
+    n: int = 100,
+    lang: str = "ja",
+) -> EvalSuite:
+    """Load multilingual SQuAD-style QA (alexandrainst/multi-wiki-qa).
+
+    Covers Chinese/Japanese/Korean (and many more) with verbatim-span answers
+    over full Wikipedia articles -- the only HF-loadable set with uniform
+    zh/ja/ko extractive QA, so it yields comparable cross-language compression
+    answer-retention numbers. License: CC-BY-NC-SA-4.0 (non-commercial).
+
+    Common lang configs: "zh-cn", "ja", "ko".
+
+    Args:
+        n: Number of samples to load
+        lang: multi-wiki-qa language config (e.g. "ja", "ko", "zh-cn")
+
+    Returns:
+        EvalSuite with multi-wiki-qa cases
+    """
+    _check_datasets_installed()
+
+    try:
+        ds = load_hf_dataset("alexandrainst/multi-wiki-qa", lang, split=f"train[:{n}]")
+    except Exception as e:
+        raise ValueError(f"Failed to load multi-wiki-qa '{lang}': {e}") from e
+
+    cases: list[EvalCase] = []
+    for i, item in enumerate(ds):
+        context = item.get("context", "")
+        question = item.get("question", "")
+        answers = item.get("answers") or {}
+        texts = answers.get("text") if isinstance(answers, dict) else None
+        ground_truth = texts[0] if texts else None
+        if not (context and question and ground_truth):
+            continue
+
+        cases.append(
+            EvalCase(
+                id=f"multi_wiki_qa_{lang}_{i}",
+                context=context,
+                query=question,
+                ground_truth=ground_truth,
+                metadata={
+                    "source": "multi-wiki-qa",
+                    "lang": lang,
+                    "title": item.get("title", ""),
+                },
+            )
+        )
+
+    return EvalSuite(name=f"multi_wiki_qa_{lang}", cases=cases)
+
+
 def load_narrativeqa(
     n: int = 100,
     split: str = "test",
@@ -458,9 +540,8 @@ def load_narrativeqa(
         EvalSuite with NarrativeQA cases
     """
     _check_datasets_installed()
-    from datasets import load_dataset
 
-    ds = load_dataset("deepmind/narrativeqa", split=split)
+    ds = load_hf_dataset("deepmind/narrativeqa", split=split)
 
     cases: list[EvalCase] = []
     for i, item in enumerate(ds):
@@ -535,6 +616,7 @@ def load_bfcl(
     import urllib.request
 
     base_url = "https://huggingface.co/datasets/gorilla-llm/Berkeley-Function-Calling-Leaderboard/resolve/main"
+    guard_egress("BFCL eval-dataset download", base_url)
     data_file = f"BFCL_v3_{category}.json"
     gt_file = f"possible_answer/BFCL_v3_{category}.json"
 
@@ -621,10 +703,9 @@ def load_toolbench(
         EvalSuite with ToolBench cases
     """
     _check_datasets_installed()
-    from datasets import load_dataset
 
     try:
-        ds = load_dataset("ToolBench/ToolBench", category, split="test")
+        ds = load_hf_dataset("ToolBench/ToolBench", category, split="test")
     except Exception as e:
         raise ValueError(f"Failed to load ToolBench category '{category}': {e}") from e
 
@@ -704,10 +785,9 @@ def load_codesearchnet(
         EvalSuite with CodeSearchNet cases
     """
     _check_datasets_installed()
-    from datasets import load_dataset
 
     try:
-        ds = load_dataset("code_search_net", language, split=split)
+        ds = load_hf_dataset("code_search_net", language, split=split)
     except Exception as e:
         raise ValueError(f"Failed to load CodeSearchNet for '{language}': {e}") from e
 
@@ -760,9 +840,8 @@ def load_humaneval(
         EvalSuite with HumanEval cases
     """
     _check_datasets_installed()
-    from datasets import load_dataset
 
-    ds = load_dataset("openai_humaneval", split="test")
+    ds = load_hf_dataset("openai_humaneval", split="test")
 
     cases: list[EvalCase] = []
     for i, item in enumerate(ds):
@@ -1098,47 +1177,6 @@ def load_custom_dataset(path: Path | str) -> EvalSuite:
     return EvalSuite.from_jsonl(path)
 
 
-def generate_retrieval_probes(
-    context: str,
-    n_probes: int = 5,
-) -> list[str]:
-    """Generate retrieval probes from a context.
-
-    Extracts key facts/entities that should be retrievable
-    after compression.
-
-    Args:
-        context: The context to analyze
-        n_probes: Number of probes to generate
-
-    Returns:
-        List of fact strings to probe for
-    """
-    import re
-
-    probes = []
-
-    # Look for specific patterns
-    patterns = [
-        r"\b[A-Z][a-z]+ [A-Z][a-z]+\b",  # Names (e.g., "John Smith")
-        r"\b\d{4}-\d{2}-\d{2}\b",  # Dates (e.g., "2024-01-15")
-        r"\b[A-Z]{2,}\b",  # Acronyms (e.g., "API", "HTTP")
-        r"\b\d+\.\d+%?\b",  # Numbers (e.g., "99.9%", "123.45")
-        r'"[^"]{5,50}"',  # Quoted strings
-        r"\b[a-z_]+_[a-z_]+\b",  # Snake case identifiers
-    ]
-
-    for pattern in patterns:
-        matches = re.findall(pattern, context)
-        for match in matches[:2]:  # Take up to 2 per pattern
-            if match not in probes:
-                probes.append(match.strip('"'))
-            if len(probes) >= n_probes:
-                return probes
-
-    return probes
-
-
 # =============================================================================
 # DATASET REGISTRY & UTILITIES
 # =============================================================================
@@ -1187,6 +1225,13 @@ DATASET_REGISTRY: dict[str, dict[str, Any]] = {
         "loader": load_narrativeqa,
         "description": "Story comprehension requiring narrative understanding",
         "category": "long_context",
+        "default_n": 100,
+    },
+    # Multilingual
+    "multi_wiki_qa": {
+        "loader": load_multi_wiki_qa,
+        "description": "Multilingual (zh/ja/ko) Wikipedia QA with verbatim-span answers",
+        "category": "rag_multilingual",
         "default_n": 100,
     },
     # Tool Use
