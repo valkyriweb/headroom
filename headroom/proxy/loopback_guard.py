@@ -40,6 +40,9 @@ CSRF / DNS-rebinding guidance and the standard Starlette
 from __future__ import annotations
 
 import ipaddress
+import os
+import socket
+import struct
 
 try:
     from fastapi import HTTPException, Request
@@ -50,9 +53,15 @@ except ImportError:  # pragma: no cover - fastapi is a hard dep in practice
 
 __all__ = [
     "LOOPBACK_HOSTS",
+    "get_container_host_gateway",
+    "is_container_environment",
+    "is_container_host_gateway",
+    "is_ip_literal_host_header",
     "is_loopback_host",
     "is_loopback_host_header",
     "require_loopback",
+    "require_loopback_or_container_gateway",
+    "require_same_origin",
 ]
 
 
@@ -67,9 +76,15 @@ LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost"})
 def is_loopback_host(host: str | None) -> bool:
     """Return True if ``host`` represents a loopback interface.
 
-    ``None`` is treated as loopback — this covers ``TestClient`` /
-    UDS-style requests where FastAPI does not populate
-    ``request.client``.
+    ``None`` is **not** loopback. A missing peer address (a Unix-domain
+    socket, an ASGI adapter that leaves ``scope["client"]`` unset, a
+    hand-built request double) is no evidence that the caller is local, and
+    every guard built on this helper -- the inbound token gate, the
+    ``/admin`` and ``/debug`` 404 guards, the WebSocket gate -- must fail
+    closed on it rather than silently disable itself. ``identity.py`` has
+    always treated it that way; this makes the rest of the proxy agree.
+    Tests that need a local caller set an explicit loopback peer
+    (``TestClient(app, client=("127.0.0.1", 12345))``).
 
     ``"localhost"`` is special-cased as a string since it is not a
     valid IP literal. The comparison is case-insensitive because
@@ -80,7 +95,7 @@ def is_loopback_host(host: str | None) -> bool:
     default. Malformed input returns ``False``.
     """
     if host is None:
-        return True
+        return False
     if host.lower() == "localhost":
         return True
     try:
@@ -128,6 +143,46 @@ def is_loopback_host_header(header_value: str | None) -> bool:
     return is_loopback_host(host_part)
 
 
+def is_ip_literal_host_header(header_value: str | None) -> bool:
+    """Return whether ``Host:`` contains an IPv4 or bracketed IPv6 literal.
+
+    Dashboard clients may use a non-loopback server address, but retaining an
+    IP-literal Host requirement prevents DNS-rebinding requests from using an
+    attacker-controlled hostname. Ports are accepted in normal HTTP forms.
+    """
+    if not header_value:
+        return False
+
+    candidate = header_value.strip()
+    if not candidate or "/" in candidate or "@" in candidate:
+        return False
+
+    if candidate.startswith("["):
+        closing = candidate.find("]")
+        if closing == -1 or candidate.count("[") != 1 or candidate.count("]") != 1:
+            return False
+        host_part = candidate[1:closing]
+        suffix = candidate[closing + 1 :]
+        if suffix and (not suffix.startswith(":") or not suffix[1:].isdigit()):
+            return False
+        try:
+            return isinstance(ipaddress.ip_address(host_part), ipaddress.IPv6Address)
+        except ValueError:
+            return False
+
+    if candidate.count(":") == 1:
+        host_part, port = candidate.rsplit(":", 1)
+        if not port.isdigit():
+            return False
+    else:
+        host_part = candidate
+
+    try:
+        return isinstance(ipaddress.ip_address(host_part), ipaddress.IPv4Address)
+    except ValueError:
+        return False
+
+
 def require_loopback(request: Request) -> None:  # type: ignore[valid-type]
     """FastAPI dependency: 404 any non-loopback caller.
 
@@ -172,3 +227,154 @@ def require_loopback(request: Request) -> None:  # type: ignore[valid-type]
         host_header = None
     if not is_loopback_host_header(host_header):
         raise HTTPException(status_code=404)
+
+
+def is_container_environment() -> bool:
+    """Return True if running inside a container or containerized deployment."""
+    if os.environ.get("HEADROOM_CONTAINER_HOST_GATEWAY"):
+        return True
+    if os.environ.get("HEADROOM_DEPLOYMENT_RUNTIME") in ("docker", "podman", "container"):
+        return True
+    if os.environ.get("HEADROOM_DEPLOYMENT_PRESET") == "persistent-docker":
+        return True
+    if os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv"):
+        return True
+    try:
+        with open("/proc/1/cgroup", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+            if any(marker in content for marker in ("docker", "containerd", "kubepods", "libpod")):
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def _read_linux_default_gateway() -> str | None:
+    """Read the default IPv4 gateway address from /proc/net/route."""
+    try:
+        with open("/proc/net/route", encoding="ascii") as f:
+            for line in f:
+                fields = line.strip().split()
+                if len(fields) >= 3 and fields[1] == "00000000":
+                    gw_hex = fields[2]
+                    if len(gw_hex) == 8:
+                        gw_int = int(gw_hex, 16)
+                        if gw_int != 0:
+                            return socket.inet_ntoa(struct.pack("<L", gw_int))
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def get_container_host_gateway() -> str | None:
+    """Return the container host gateway IP if running in a container.
+
+    Checks ``HEADROOM_CONTAINER_HOST_GATEWAY`` first, and falls back to
+    resolving the default gateway from ``/proc/net/route`` when running
+    inside a container environment. Returns None when not in a container or
+    if no gateway can be determined.
+    """
+    env_gw = os.environ.get("HEADROOM_CONTAINER_HOST_GATEWAY")
+    if env_gw:
+        env_gw = env_gw.strip()
+        if env_gw:
+            return env_gw
+    if not is_container_environment():
+        return None
+    return _read_linux_default_gateway()
+
+
+def _normalize_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    return ip
+
+
+def is_container_host_gateway(host: str | None) -> bool:
+    """Return True if ``host`` matches the container host gateway IP.
+
+    Always returns False if not in a container environment or if ``host``
+    is empty. Correctly handles IPv4-mapped IPv6 addresses (e.g.
+    ``::ffff:172.17.0.1``).
+    """
+    if not host or not is_container_environment():
+        return False
+    gateway = get_container_host_gateway()
+    if not gateway:
+        return False
+    parsed_host = _normalize_ip(host)
+    parsed_gw = _normalize_ip(gateway)
+    if parsed_host is not None and parsed_gw is not None:
+        return parsed_host == parsed_gw
+    return host.strip() == gateway.strip()
+
+
+def require_loopback_or_container_gateway(request: Request) -> None:  # type: ignore[valid-type]
+    """FastAPI dependency: allow loopback callers or container host gateway.
+
+    Used by routes like ``/v1/compress`` and ``/v1/usage``. When running inside
+    a container environment (Docker / Podman), incoming host traffic forwarded
+    over the container bridge arrives with the host gateway IP (e.g. 172.17.0.1)
+    rather than a loopback interface.
+
+    Enforces two gates:
+    1. Client address must be either loopback (:func:`is_loopback_host`) or
+       the container host default gateway (:func:`is_container_host_gateway`).
+       Arbitrary peer containers on the same bridge network are rejected.
+    2. The inbound ``Host:`` header must name a loopback host
+       (:func:`is_loopback_host_header`). This blocks DNS-rebinding attacks and
+       rejects callers addressing the container's bridge IP or hostname directly.
+    """
+    if HTTPException is None:  # pragma: no cover - defensive
+        raise RuntimeError("FastAPI is required for the loopback guard")
+
+    client = getattr(request, "client", None)
+    host = getattr(client, "host", None) if client is not None else None
+    if not (is_loopback_host(host) or is_container_host_gateway(host)):
+        raise HTTPException(status_code=404)
+
+    headers = getattr(request, "headers", None)
+    if headers is None:
+        return
+    try:
+        host_header = headers.get("host")
+    except AttributeError:
+        host_header = None
+    if not is_loopback_host_header(host_header):
+        raise HTTPException(status_code=404)
+
+
+def require_same_origin(request: Request) -> None:  # type: ignore[valid-type]
+    """FastAPI dependency: reject cross-origin browser requests on mutating routes.
+
+    ``require_loopback``'s Host-header check stops DNS-rebinding, but not a
+    plain CSRF where a remote page's JS targets a known
+    ``http://127.0.0.1:<port>`` URL directly with a non-preflighted "simple"
+    request (e.g. ``Content-Type: text/plain`` carrying a JSON body) -- the
+    browser's ``Host:`` header still reads the real destination (loopback),
+    but its ``Origin:`` header reflects the page's actual origin. CORS alone
+    does not stop this: CORS only blocks the attacker's JS from *reading* the
+    response, not the server from acting on the request.
+
+    Reject when ``Origin`` is present and does not itself name a loopback
+    host, or is the opaque literal ``"null"`` (sandboxed iframe / ``file://``
+    page). Requests with no ``Origin`` header (CLI tools, curl, ``TestClient``,
+    same-origin simple navigations) pass through unchanged -- a real browser
+    always sets ``Origin`` on cross-origin fetch/XHR.
+    """
+    if HTTPException is None:  # pragma: no cover - defensive
+        raise RuntimeError("FastAPI is required for the same-origin guard")
+
+    headers = getattr(request, "headers", None)
+    origin = headers.get("origin") if headers is not None else None
+    if not origin:
+        return
+    if origin == "null":
+        raise HTTPException(status_code=403, detail="cross-origin request rejected")
+    host_part = origin.split("://", 1)[-1].split("/", 1)[0]
+    if not is_loopback_host_header(host_part):
+        raise HTTPException(status_code=403, detail="cross-origin request rejected")

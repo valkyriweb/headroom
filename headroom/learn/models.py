@@ -67,10 +67,10 @@ class ToolCall:
             return cmd[:100] + "..." if len(cmd) > 100 else cmd
         if self.name in ("Read", "read"):
             return str(self.input_data.get("file_path", "?"))
-        if self.name in ("Grep", "grep"):
-            return str(self.input_data.get("pattern", "?"))
-        if self.name in ("Glob", "glob"):
-            return str(self.input_data.get("pattern", "?"))
+        if self.name in ("Grep", "grep", "Glob", "glob"):
+            pattern = self.input_data.get("pattern", "?")
+            path = self.input_data.get("path", "?")
+            return f"{pattern} in {path}"
         if self.name in ("Edit", "edit", "Write", "write"):
             return str(self.input_data.get("file_path", "?"))
         return str(self.input_data)[:80]
@@ -134,6 +134,10 @@ class ProjectInfo:
     data_path: Path  # Where conversation logs are stored
     context_file: Path | None = None  # CLAUDE.md / .cursorrules / AGENTS.md
     memory_file: Path | None = None  # MEMORY.md or equivalent
+    # Linked git worktrees folded into this project: their checkouts, and the
+    # extra folders their conversation logs are stored in.
+    worktree_paths: list[Path] = field(default_factory=list)
+    extra_data_paths: list[Path] = field(default_factory=list)
 
 
 # =============================================================================
@@ -158,6 +162,23 @@ class Recommendation:
     confidence: float = 0.0  # 0-1, based on evidence strength
     evidence_count: int = 0  # Number of failures supporting this
     estimated_tokens_saved: int = 0  # Projected savings if recommendation is followed
+    # Loop weighting (see headroom.learn.loops): set when this recommendation
+    # guards against a detected repeated pattern. Loop guardrails are ranked
+    # above one-off rules because their waste scales with repetition.
+    is_loop_guardrail: bool = False
+    loop_occurrences: int = 0  # Repetitions of the loop this rule guards against
+    # Preserve prior markdown-list items in the same section. This is opt-in
+    # because most analyzers treat a re-surfaced section as authoritative.
+    preserve_prior_items: bool = False
+    # Authoritative lifecycle signal for `preserve_prior_items`: the pattern
+    # ids the producing learner still considers active, including the ones
+    # left out of this batch by ranking or top-N capping. A prior item
+    # survives only while its id is in this set, which is what makes deletion
+    # possible — expired, tombstoned, or disproven items drop out of the set
+    # and are then removed from the file. `None` means the producer has no
+    # lifecycle signal at all; preservation then falls back to a plain union
+    # of new and prior items.
+    active_item_ids: frozenset[str] | None = None
 
 
 @dataclass
@@ -169,6 +190,7 @@ class AnalysisResult:
     total_calls: int = 0
     total_failures: int = 0
     recommendations: list[Recommendation] = field(default_factory=list)
+    analysis_error: str | None = None
 
     @property
     def failure_rate(self) -> float:

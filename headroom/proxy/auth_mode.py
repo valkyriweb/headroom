@@ -18,59 +18,22 @@ spot bad clients without taking the proxy down.
 
 from __future__ import annotations
 
-import base64
-import enum
-import json
 import logging
 from collections.abc import Mapping
 from typing import Any
 
-logger = logging.getLogger(__name__)
-
-
-class AuthMode(str, enum.Enum):
-    """Three auth-mode classes Headroom routes compression policy through.
-
-    Subclasses :class:`str` so the enum members serialize transparently
-    into structured logs / metric labels / TOIN aggregation keys. The
-    string form matches the Rust ``AuthMode::as_str()`` output exactly.
-    """
-
-    #: Pay-as-you-go API key. Aggressive live-zone compression OK.
-    PAYG = "payg"
-
-    #: OAuth bearer / Bedrock IAM / Vertex ADC. Passthrough-prefer:
-    #: no auto-cache_control, no auto-prompt_cache_key, no lossy
-    #: compressors. Lossless-only path.
-    OAUTH = "oauth"
-
-    #: Subscription-bound CLI / IDE. Stealth: same as OAuth + preserve
-    #: ``accept-encoding``, never strip; never inject ``X-Headroom-*``;
-    #: never mutate ``User-Agent``.
-    SUBSCRIPTION = "subscription"
-
-
-# User-Agent prefixes that identify a UX-bound CLI / IDE.
-#
-# Lives at module scope (not inside :func:`classify_auth_mode`) so:
-# 1. A future PR can swap this for a configurable list (Phase F
-#    follow-up) without touching the function body.
-# 2. Adding a new client = one-line edit here, no logic change.
-#
-# Match is ``str.__contains__`` against a lowercased copy of the UA —
-# so the prefix can appear anywhere in the value.
-SUBSCRIPTION_UA_PREFIXES: tuple[str, ...] = (
-    "claude-cli/",
-    "claude-code/",
-    "codex-cli/",
-    "cursor/",
-    "claude-vscode/",
-    "github-copilot/",
-    "anthropic-cli/",
-    "antigravity/",
+from headroom.proxy.auth_policy import (
+    CLIENT_UA_MAP,
+    CODEX_RESPONSES_PATH,
+    SUBSCRIPTION_UA_PREFIXES,
+    AuthMode,
+    AuthSignals,
+    classify_auth_signals,
+    classify_client_signals,
+    should_stamp_codex_client_signals,
 )
 
-_OPENAI_AUTH_CLAIM_NAMESPACE = "https://api.openai.com/auth"
+logger = logging.getLogger(__name__)
 
 
 def _header_get(headers: Mapping[str, Any] | Any, name: str) -> str:
@@ -112,32 +75,16 @@ def _header_get(headers: Mapping[str, Any] | Any, name: str) -> str:
     return str(value)
 
 
-def _decode_bearer_jwt_payload(headers: Mapping[str, Any] | Any) -> dict[str, Any] | None:
-    """Best-effort JWT payload decode for routing/classification hints only."""
-    auth = _header_get(headers, "authorization")
-    scheme, _, token = auth.partition(" ")
-    if scheme.lower() != "bearer" or token.count(".") < 2:
-        return None
-
-    payload = token.split(".", 2)[1]
-    payload += "=" * (-len(payload) % 4)
-    try:
-        decoded = base64.urlsafe_b64decode(payload.encode("ascii"))
-        data = json.loads(decoded.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def _has_chatgpt_codex_subscription_hint(headers: Mapping[str, Any] | Any) -> bool:
-    """Return True for ChatGPT/Codex subscription auth forwarded by Codex/Pi."""
-    if _header_get(headers, "chatgpt-account-id").strip():
-        return True
-
-    payload = _decode_bearer_jwt_payload(headers)
-    auth_claims = payload.get(_OPENAI_AUTH_CLAIM_NAMESPACE) if isinstance(payload, dict) else None
-    account_id = auth_claims.get("chatgpt_account_id") if isinstance(auth_claims, dict) else None
-    return isinstance(account_id, str) and bool(account_id.strip())
+def _auth_signals(headers: Mapping[str, Any] | Any) -> AuthSignals:
+    """Adapt a header mapping into pure auth policy inputs."""
+    return AuthSignals(
+        user_agent=_header_get(headers, "user-agent"),
+        authorization=_header_get(headers, "authorization"),
+        x_api_key=_header_get(headers, "x-api-key"),
+        x_goog_api_key=_header_get(headers, "x-goog-api-key"),
+        x_client=_header_get(headers, "x-client"),
+        chatgpt_account_id=_header_get(headers, "chatgpt-account-id"),
+    )
 
 
 def classify_auth_mode(headers: Mapping[str, Any] | Any) -> AuthMode:
@@ -148,26 +95,25 @@ def classify_auth_mode(headers: Mapping[str, Any] | Any) -> AuthMode:
     1. **Subscription UA prefix** → :data:`AuthMode.SUBSCRIPTION`.
        The CLI's own auth-mode wins over the bearer token shape it
        happens to be carrying — a Claude Code session uses a
-       ``sk-ant-oat-*`` token but is a subscription client, not OAuth.
+       ``sk-ant-oat*`` token but is a subscription client, not OAuth.
     2. **ChatGPT/Codex account header or JWT claim** →
        :data:`AuthMode.SUBSCRIPTION` (Codex CLI / Pi Codex subscription auth).
-    3. **``Authorization: Bearer sk-ant-oat-*``** → :data:`AuthMode.OAUTH`
+    2b. **``Authorization: Bearer sk-ant-oat*``** → :data:`AuthMode.OAUTH`
        (Claude Pro / Max OAuth). Checked before the broader ``sk-``
-       PAYG rule because ``sk-ant-oat-`` shares the ``sk-`` prefix.
-    4. **``Authorization: Bearer sk-ant-api*`` or ``Bearer sk-*``** →
+       PAYG rule because ``sk-ant-oat`` shares the ``sk-`` prefix.
+    3. **``Authorization: Bearer sk-ant-api*`` or ``Bearer sk-*``** →
        :data:`AuthMode.PAYG` (Anthropic / OpenAI API key).
-    5. **``Authorization: Bearer <jwt>``** (3 dot-separated segments)
-       → :data:`AuthMode.OAUTH` (Cursor / Copilot OAuth, unless it has
-       the ChatGPT/Codex subscription claim handled above).
-    6. **``Authorization`` present but not ``Bearer ...``** →
+    4. **``Authorization: Bearer <jwt>``** (3 dot-separated segments)
+       → :data:`AuthMode.OAUTH` (Codex / Cursor / Copilot OAuth).
+    5. **``Authorization`` present but not ``Bearer ...``** →
        :data:`AuthMode.OAUTH` (AWS SigV4 ``AWS4-HMAC-SHA256 ...`` →
        Bedrock; any other non-Bearer scheme is presumed
        passthrough-prefer too).
-    7. **``x-api-key`` present** → :data:`AuthMode.PAYG` (Anthropic
+    6. **``x-api-key`` present** → :data:`AuthMode.PAYG` (Anthropic
        API key style).
-    8. **``x-goog-api-key`` present** → :data:`AuthMode.PAYG` (Gemini
+    7. **``x-goog-api-key`` present** → :data:`AuthMode.PAYG` (Gemini
        key).
-    9. **Default** → :data:`AuthMode.PAYG` (safest default; aggressive
+    8. **Default** → :data:`AuthMode.PAYG` (safest default; aggressive
        compression on a misclassified request just costs us a re-run,
        not a revoked subscription).
 
@@ -175,89 +121,7 @@ def classify_auth_mode(headers: Mapping[str, Any] | Any) -> AuthMode:
     other matches are zero-allocation ``startswith`` / ``in`` /
     ``str.split('.')``. Target: <10us per call.
     """
-    # ── User-Agent ────────────────────────────────────────────────
-    ua_lower = _header_get(headers, "user-agent").lower()
-    for prefix in SUBSCRIPTION_UA_PREFIXES:
-        if prefix in ua_lower:
-            return AuthMode.SUBSCRIPTION
-
-    # ── ChatGPT/Codex subscription auth ───────────────────────────
-    # Pi's OpenAI-Codex provider uses its own User-Agent (`pi (...)`) but
-    # forwards ChatGPT subscription auth with `chatgpt-account-id` and/or the
-    # same account id claim embedded in the OAuth JWT. Treat it like Codex CLI
-    # for compression-policy purposes so history rewrites stay live-zone-only.
-    if _has_chatgpt_codex_subscription_hint(headers):
-        return AuthMode.SUBSCRIPTION
-
-    # ── Authorization header ──────────────────────────────────────
-    auth = _header_get(headers, "authorization")
-
-    if auth.startswith("Bearer "):
-        token = auth[len("Bearer ") :]
-        # Order matters: `sk-ant-oat-*` shares a prefix with
-        # `sk-ant-api*` only at `sk-ant-`, so check OAuth first.
-        if token.startswith("sk-ant-oat-"):
-            return AuthMode.OAUTH
-        if token.startswith("sk-ant-api") or token.startswith("sk-"):
-            return AuthMode.PAYG
-        # JWT: classic three-segment `header.payload.signature`.
-        # We don't validate the JWT — just count dot-separated
-        # segments. Catches Codex / Cursor / Copilot OAuth.
-        if len(token.split(".")) >= 3:
-            return AuthMode.OAUTH
-        # Unknown bearer shape — fall through.
-    elif auth:
-        # Authorization is present but NOT `Bearer ...` — most
-        # commonly AWS SigV4 (`AWS4-HMAC-SHA256 ...`) on a Bedrock
-        # request, or a `Basic ...` from a custom proxy chain. We
-        # treat all such non-Bearer schemes as passthrough-prefer.
-        return AuthMode.OAUTH
-
-    # ── Vendor-specific API-key headers ───────────────────────────
-    if _header_get(headers, "x-api-key"):
-        return AuthMode.PAYG
-    if _header_get(headers, "x-goog-api-key"):
-        return AuthMode.PAYG
-
-    # ── Default ───────────────────────────────────────────────────
-    return AuthMode.PAYG
-
-
-# Client (harness) identification — maps a User-Agent substring to a
-# short normalized client name. The dashboard / `headroom perf` use
-# this to slice traffic by harness ("aider is 30% of cache writes",
-# "codex p99 latency vs claude-code", etc).
-#
-# Adding a new client: one line. Same surface as
-# :data:`SUBSCRIPTION_UA_PREFIXES`. The classifier is intentionally
-# substring-based (not regex) so a tuple of literals stays the
-# extension point.
-CLIENT_UA_MAP: tuple[tuple[str, str], ...] = (
-    # Anthropic ecosystem
-    ("claude-code/", "claude-code"),
-    ("claude-cli/", "claude-code"),
-    ("claude-vscode/", "claude-vscode"),
-    ("anthropic-cli/", "anthropic-cli"),
-    # OpenAI ecosystem
-    ("codex-cli/", "codex"),
-    # Editors / IDEs
-    ("cursor/", "cursor"),
-    ("zed/", "zed"),
-    # Other AI coding harnesses
-    ("aider/", "aider"),
-    ("droid/", "droid"),
-    ("opencode/", "opencode"),
-    ("github-copilot/", "copilot"),
-    # Google's experimental harness
-    ("antigravity/", "antigravity"),
-    # AWS Strands Agents SDK. The default openai-python User-Agent
-    # is `OpenAI/Python <ver>` which does not embed any Strands
-    # signal, so production callers should set `X-Client: strands`
-    # explicitly (see `headroom/integrations/strands/README.md`).
-    # The UA prefix below covers any Strands runtime that injects
-    # its own segment ahead of the openai-python UA.
-    ("strands-agents/", "strands"),
-)
+    return classify_auth_signals(_auth_signals(headers))
 
 
 def classify_client(headers: Mapping[str, Any] | Any, *, default: str | None = None) -> str | None:
@@ -272,8 +136,7 @@ def classify_client(headers: Mapping[str, Any] | Any, *, default: str | None = N
        — covers the unmodified-client case. Substring, not prefix,
        because some clients prepend a corporate-wrapper UA before
        their own.
-    3. **ChatGPT/Codex subscription auth hint** → ``codex``.
-    4. **None** when neither produces a hit. ``None`` is the loud
+    3. **None** when neither produces a hit. ``None`` is the loud
        "unknown harness" signal; downstream consumers can group
        these as "unidentified" rather than silently bucketing them
        into a default.
@@ -283,28 +146,7 @@ def classify_client(headers: Mapping[str, Any] | Any, *, default: str | None = N
     empty string". The :class:`RequestOutcome` field has the same
     type for the same reason.
     """
-    # 1. Explicit override
-    explicit = _header_get(headers, "x-client").strip().lower()
-    if explicit:
-        return explicit
-    # 2. User-Agent substring match
-    ua_lower = _header_get(headers, "user-agent").lower()
-    if ua_lower:
-        for needle, name in CLIENT_UA_MAP:
-            if needle in ua_lower:
-                return name
-    # 3. ChatGPT/Codex subscription auth hint. Pi's UA is `pi (...)`, so this
-    # catches the real subscription route even when no explicit X-Client exists.
-    if _has_chatgpt_codex_subscription_hint(headers):
-        return "codex"
-    return default
-
-
-# OpenAI's Responses API endpoint. In practice this is Codex's endpoint, but a
-# proxy can't assume every caller here is Codex — hence
-# :func:`should_stamp_codex_client` only stamps callers that don't already
-# classify.
-CODEX_RESPONSES_PATH = "/v1/responses"
+    return classify_client_signals(_auth_signals(headers), default=default)
 
 
 def should_stamp_codex_client(path: str, headers: Mapping[str, Any] | Any) -> bool:
@@ -320,9 +162,29 @@ def should_stamp_codex_client(path: str, headers: Mapping[str, Any] | Any) -> bo
     recognized User-Agent) on the Responses endpoint. A caller that already
     classifies is left untouched.
     """
-    if path != CODEX_RESPONSES_PATH and not path.startswith(CODEX_RESPONSES_PATH + "/"):
-        return False
-    return classify_client(headers) is None
+    return should_stamp_codex_client_signals(path, _auth_signals(headers))
+
+
+# Client harnesses that can consume Headroom's mid-turn message-coalescing
+# protocol: the 202 ``headroom_queued`` reply and the synthetic
+# ``headroom_pending_messages`` SSE event. This is a custom protocol only Claude
+# Code parses today; other harnesses would receive events they can't decode, so
+# a concurrent same-session request from them must stream normally instead of
+# being queued and replayed. Keeping the capability in one named place — rather
+# than scattering ``client == "claude-code"`` string checks across the request
+# handlers — makes it a single, documented decision to revisit as more clients
+# learn the protocol (#1608).
+_COALESCING_CAPABLE_CLIENTS = frozenset({"claude-code"})
+
+
+def supports_mid_turn_coalescing(client: str | None) -> bool:
+    """Whether ``client`` can consume the mid-turn coalescing protocol.
+
+    ``client`` is a value returned by :func:`classify_client`. See
+    :data:`_COALESCING_CAPABLE_CLIENTS` for why the set is currently limited to
+    Claude Code.
+    """
+    return client in _COALESCING_CAPABLE_CLIENTS
 
 
 __all__ = [
@@ -333,4 +195,5 @@ __all__ = [
     "classify_auth_mode",
     "classify_client",
     "should_stamp_codex_client",
+    "supports_mid_turn_coalescing",
 ]

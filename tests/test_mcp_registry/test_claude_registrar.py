@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import subprocess
 from pathlib import Path
 from unittest.mock import patch
@@ -10,7 +12,11 @@ from unittest.mock import patch
 import pytest
 
 from headroom.mcp_registry.base import RegisterStatus, ServerSpec
-from headroom.mcp_registry.claude import ClaudeRegistrar
+from headroom.mcp_registry.claude import SCOPE_LOCAL, SCOPE_USER, ClaudeRegistrar
+from headroom.mcp_registry.install import build_headroom_spec
+
+_RESOLVED_COMMAND = ("/usr/bin/python", "-m", "headroom.cli")
+_RESOLVED_ARGS = ("-m", "headroom.cli", "mcp", "serve")
 
 
 def _make_registrar(
@@ -25,10 +31,18 @@ def _make_registrar(
 def _spec() -> ServerSpec:
     return ServerSpec(
         name="headroom",
-        command="headroom",
-        args=("mcp", "serve"),
+        command="/usr/bin/python",
+        args=("-m", "headroom.cli", "mcp", "serve"),
         env={},
     )
+
+
+def _install_spec(monkeypatch: pytest.MonkeyPatch) -> ServerSpec:
+    monkeypatch.setattr(
+        "headroom.mcp_registry.install.resolve_headroom_command",
+        lambda: list(_RESOLVED_COMMAND),
+    )
+    return build_headroom_spec()
 
 
 # ----------------------------------------------------------------------
@@ -43,6 +57,12 @@ def test_detect_true_when_cli_present(tmp_path: Path) -> None:
 
 def test_detect_true_when_only_claude_dir_exists(tmp_path: Path) -> None:
     (tmp_path / ".claude").mkdir()
+    reg = _make_registrar(tmp_path, cli=None)
+    assert reg.detect() is True
+
+
+def test_detect_true_when_only_modern_config_exists(tmp_path: Path) -> None:
+    (tmp_path / ".claude.json").write_text("{}")
     reg = _make_registrar(tmp_path, cli=None)
     assert reg.detect() is True
 
@@ -63,15 +83,14 @@ def test_get_server_returns_none_when_unregistered(tmp_path: Path) -> None:
 
 
 def test_get_server_reads_modern_config(tmp_path: Path) -> None:
-    cfg = tmp_path / ".claude" / ".claude.json"
-    cfg.parent.mkdir()
+    cfg = tmp_path / ".claude.json"
     cfg.write_text(
         json.dumps(
             {
                 "mcpServers": {
                     "headroom": {
-                        "command": "headroom",
-                        "args": ["mcp", "serve"],
+                        "command": _RESOLVED_COMMAND[0],
+                        "args": list(_RESOLVED_ARGS),
                         "env": {"HEADROOM_PROXY_URL": "http://127.0.0.1:9000"},
                     }
                 }
@@ -81,8 +100,8 @@ def test_get_server_reads_modern_config(tmp_path: Path) -> None:
     reg = _make_registrar(tmp_path, cli=None)
     got = reg.get_server("headroom")
     assert got is not None
-    assert got.command == "headroom"
-    assert got.args == ("mcp", "serve")
+    assert got.command == _RESOLVED_COMMAND[0]
+    assert got.args == _RESOLVED_ARGS
     assert got.env == {"HEADROOM_PROXY_URL": "http://127.0.0.1:9000"}
 
 
@@ -90,13 +109,22 @@ def test_get_server_falls_back_to_legacy(tmp_path: Path) -> None:
     cfg = tmp_path / ".claude" / "mcp.json"
     cfg.parent.mkdir()
     cfg.write_text(
-        json.dumps({"mcpServers": {"headroom": {"command": "headroom", "args": ["mcp", "serve"]}}})
+        json.dumps(
+            {
+                "mcpServers": {
+                    "headroom": {
+                        "command": _RESOLVED_COMMAND[0],
+                        "args": list(_RESOLVED_ARGS),
+                    }
+                }
+            }
+        )
     )
     reg = _make_registrar(tmp_path, cli=None)
     got = reg.get_server("headroom")
     assert got is not None
-    assert got.command == "headroom"
-    assert got.args == ("mcp", "serve")
+    assert got.command == _RESOLVED_COMMAND[0]
+    assert got.args == _RESOLVED_ARGS
     assert got.env == {}
 
 
@@ -105,14 +133,24 @@ def test_get_server_reads_claude_config_dir(
 ) -> None:
     cfg = tmp_path / ".claude.json"
     cfg.write_text(
-        json.dumps({"mcpServers": {"headroom": {"command": "headroom", "args": ["mcp", "serve"]}}})
+        json.dumps(
+            {
+                "mcpServers": {
+                    "headroom": {
+                        "command": _RESOLVED_COMMAND[0],
+                        "args": list(_RESOLVED_ARGS),
+                    }
+                }
+            }
+        )
     )
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     reg = ClaudeRegistrar(claude_cli=None)
     got = reg.get_server("headroom")
     assert got is not None
-    assert got.command == "headroom"
-    assert got.args == ("mcp", "serve")
+    assert got.command == _RESOLVED_COMMAND[0]
+    assert got.args == _RESOLVED_ARGS
 
 
 # ----------------------------------------------------------------------
@@ -120,14 +158,17 @@ def test_get_server_reads_claude_config_dir(
 # ----------------------------------------------------------------------
 
 
-def test_register_via_cli_calls_claude_mcp_add(tmp_path: Path) -> None:
+def test_register_via_cli_calls_claude_mcp_add(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     reg = _make_registrar(tmp_path, cli="/usr/local/bin/claude")
     fake_result = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
     with patch("subprocess.run", return_value=fake_result) as run_mock:
-        result = reg.register_server(_spec())
+        result = reg.register_server(_install_spec(monkeypatch))
     assert result.status == RegisterStatus.REGISTERED
-    cmds = [call.args[0] for call in run_mock.call_args_list]
-    add_cmd = next(c for c in cmds if "add" in c)
+    add_call = run_mock.call_args
+    assert add_call is not None
+    add_cmd = add_call.args[0]
     assert add_cmd[:6] == [
         "/usr/local/bin/claude",
         "mcp",
@@ -136,40 +177,68 @@ def test_register_via_cli_calls_claude_mcp_add(tmp_path: Path) -> None:
         "-s",
         "user",
     ]
-    assert add_cmd[-3:] == ["--", "headroom", "mcp"] or add_cmd[-4:] == [
+    assert add_cmd[-(len(_RESOLVED_ARGS) + 2) :] == [
         "--",
-        "headroom",
-        "mcp",
-        "serve",
+        _RESOLVED_COMMAND[0],
+        *_RESOLVED_ARGS,
     ]
+    assert add_call.kwargs["env"]["CLAUDE_CONFIG_DIR"] == str(tmp_path)
 
 
 def test_register_via_cli_includes_env(tmp_path: Path) -> None:
     spec = ServerSpec(
         name="headroom",
-        command="headroom",
-        args=("mcp", "serve"),
+        command=_RESOLVED_COMMAND[0],
+        args=_RESOLVED_ARGS,
         env={"HEADROOM_PROXY_URL": "http://127.0.0.1:9000"},
     )
     reg = _make_registrar(tmp_path, cli="/usr/local/bin/claude")
     fake_result = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
     with patch("subprocess.run", return_value=fake_result) as run_mock:
         reg.register_server(spec)
-    add_cmd = next(c for c in [call.args[0] for call in run_mock.call_args_list] if "add" in c)
+    add_call = run_mock.call_args
+    assert add_call is not None
+    add_cmd = add_call.args[0]
     assert "-e" in add_cmd
     e_idx = add_cmd.index("-e")
     assert add_cmd[e_idx + 1] == "HEADROOM_PROXY_URL=http://127.0.0.1:9000"
+    assert add_call.kwargs["env"]["CLAUDE_CONFIG_DIR"] == str(tmp_path)
+
+
+def test_register_via_cli_without_overrides_keeps_ambient_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "ambient")
+    reg = ClaudeRegistrar(claude_cli="/usr/local/bin/claude")
+    fake_result = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+    with patch("subprocess.run", return_value=fake_result) as run_mock:
+        reg.register_server(_spec())
+    assert run_mock.call_args is not None
+    assert run_mock.call_args.kwargs["env"] is None
+
+
+def test_register_via_cli_prefers_explicit_config_dir_over_ambient_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_dir = tmp_path / "explicit-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "ambient")
+    reg = ClaudeRegistrar(claude_cli="/usr/local/bin/claude", config_dir=config_dir)
+    fake_result = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+    with patch("subprocess.run", return_value=fake_result) as run_mock:
+        reg.register_server(_spec())
+    assert run_mock.call_args is not None
+    assert run_mock.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"] == str(config_dir)
 
 
 def test_register_writes_file_when_no_cli(tmp_path: Path) -> None:
     reg = _make_registrar(tmp_path, cli=None)
     result = reg.register_server(_spec())
     assert result.status == RegisterStatus.REGISTERED
-    cfg = tmp_path / ".claude" / ".claude.json"
+    cfg = tmp_path / ".claude.json"
     data = json.loads(cfg.read_text())
     assert "headroom" in data["mcpServers"]
-    assert data["mcpServers"]["headroom"]["command"] == "headroom"
-    assert data["mcpServers"]["headroom"]["args"] == ["mcp", "serve"]
+    assert data["mcpServers"]["headroom"]["command"] == _RESOLVED_COMMAND[0]
+    assert data["mcpServers"]["headroom"]["args"] == list(_RESOLVED_ARGS)
 
 
 def test_register_writes_to_legacy_when_only_legacy_exists(tmp_path: Path) -> None:
@@ -182,19 +251,20 @@ def test_register_writes_to_legacy_when_only_legacy_exists(tmp_path: Path) -> No
     data = json.loads(legacy.read_text())
     assert "headroom" in data["mcpServers"]
     # Modern config should NOT have been created.
-    assert not (tmp_path / ".claude" / ".claude.json").exists()
+    assert not (tmp_path / ".claude.json").exists()
 
 
 def test_register_writes_to_claude_config_dir(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     reg = ClaudeRegistrar(claude_cli=None)
     result = reg.register_server(_spec())
     assert result.status == RegisterStatus.REGISTERED
     cfg = tmp_path / ".claude.json"
     data = json.loads(cfg.read_text())
-    assert data["mcpServers"]["headroom"]["command"] == "headroom"
+    assert data["mcpServers"]["headroom"]["command"] == _RESOLVED_COMMAND[0]
     assert not (tmp_path / ".claude" / ".claude.json").exists()
 
 
@@ -204,10 +274,18 @@ def test_register_writes_to_claude_config_dir(
 
 
 def test_register_already_when_spec_matches(tmp_path: Path) -> None:
-    cfg = tmp_path / ".claude" / ".claude.json"
-    cfg.parent.mkdir()
+    cfg = tmp_path / ".claude.json"
     cfg.write_text(
-        json.dumps({"mcpServers": {"headroom": {"command": "headroom", "args": ["mcp", "serve"]}}})
+        json.dumps(
+            {
+                "mcpServers": {
+                    "headroom": {
+                        "command": _RESOLVED_COMMAND[0],
+                        "args": list(_RESOLVED_ARGS),
+                    }
+                }
+            }
+        )
     )
     reg = _make_registrar(tmp_path, cli="/usr/local/bin/claude")
     with patch("subprocess.run") as run_mock:
@@ -217,15 +295,14 @@ def test_register_already_when_spec_matches(tmp_path: Path) -> None:
 
 
 def test_register_mismatch_when_spec_differs_no_force(tmp_path: Path) -> None:
-    cfg = tmp_path / ".claude" / ".claude.json"
-    cfg.parent.mkdir()
+    cfg = tmp_path / ".claude.json"
     cfg.write_text(
         json.dumps(
             {
                 "mcpServers": {
                     "headroom": {
-                        "command": "headroom",
-                        "args": ["mcp", "serve"],
+                        "command": _RESOLVED_COMMAND[0],
+                        "args": list(_RESOLVED_ARGS),
                         "env": {"HEADROOM_PROXY_URL": "http://127.0.0.1:9999"},
                     }
                 }
@@ -241,8 +318,7 @@ def test_register_mismatch_when_spec_differs_no_force(tmp_path: Path) -> None:
 
 
 def test_register_force_overwrites_mismatch(tmp_path: Path) -> None:
-    cfg = tmp_path / ".claude" / ".claude.json"
-    cfg.parent.mkdir()
+    cfg = tmp_path / ".claude.json"
     cfg.write_text(
         json.dumps(
             {
@@ -277,7 +353,7 @@ def test_register_cli_failure_falls_back_to_file(tmp_path: Path) -> None:
         result = reg.register_server(_spec())
     # Even though CLI failed, we wrote the config file as a fallback.
     assert result.status == RegisterStatus.REGISTERED
-    cfg = tmp_path / ".claude" / ".claude.json"
+    cfg = tmp_path / ".claude.json"
     assert cfg.exists()
     data = json.loads(cfg.read_text())
     assert "headroom" in data["mcpServers"]
@@ -293,19 +369,20 @@ def test_unregister_via_cli(tmp_path: Path) -> None:
     ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
     with patch("subprocess.run", return_value=ok) as run_mock:
         assert reg.unregister_server("headroom") is True
-    cmd = run_mock.call_args_list[0].args[0]
+    assert run_mock.call_args is not None
+    cmd = run_mock.call_args.args[0]
     assert cmd[:5] == ["/usr/local/bin/claude", "mcp", "remove", "headroom", "-s"]
     assert cmd[5] == "user"
+    assert run_mock.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"] == str(tmp_path)
 
 
 def test_unregister_via_file_when_no_cli(tmp_path: Path) -> None:
-    cfg = tmp_path / ".claude" / ".claude.json"
-    cfg.parent.mkdir()
+    cfg = tmp_path / ".claude.json"
     cfg.write_text(
         json.dumps(
             {
                 "mcpServers": {
-                    "headroom": {"command": "headroom", "args": ["mcp", "serve"]},
+                    "headroom": {"command": _RESOLVED_COMMAND[0], "args": list(_RESOLVED_ARGS)},
                     "other": {"command": "other"},
                 }
             }
@@ -316,6 +393,18 @@ def test_unregister_via_file_when_no_cli(tmp_path: Path) -> None:
     data = json.loads(cfg.read_text())
     assert "headroom" not in data["mcpServers"]
     assert "other" in data["mcpServers"]
+
+
+def test_unregister_via_cli_also_removes_stale_legacy_entry(tmp_path: Path) -> None:
+    legacy = tmp_path / ".claude" / "mcp.json"
+    legacy.parent.mkdir()
+    legacy.write_text(json.dumps({"mcpServers": {"headroom": {"command": "old"}}}))
+    reg = _make_registrar(tmp_path, cli="/usr/local/bin/claude")
+    ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+    with patch("subprocess.run", return_value=ok):
+        assert reg.unregister_server("headroom") is True
+    data = json.loads(legacy.read_text())
+    assert "headroom" not in data["mcpServers"]
 
 
 def test_unregister_returns_false_when_absent(tmp_path: Path) -> None:
@@ -331,13 +420,14 @@ def test_unregister_removes_from_claude_config_dir(
         json.dumps(
             {
                 "mcpServers": {
-                    "headroom": {"command": "headroom", "args": ["mcp", "serve"]},
+                    "headroom": {"command": _RESOLVED_COMMAND[0], "args": list(_RESOLVED_ARGS)},
                     "other": {"command": "other"},
                 }
             }
         )
     )
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     reg = ClaudeRegistrar(claude_cli=None)
     assert reg.unregister_server("headroom") is True
     data = json.loads(cfg.read_text())
@@ -352,8 +442,660 @@ def test_unregister_removes_from_claude_config_dir(
 
 @pytest.mark.parametrize("contents", ["", "not json", "{", "[]"])
 def test_get_server_robust_to_bad_json(tmp_path: Path, contents: str) -> None:
-    cfg = tmp_path / ".claude" / ".claude.json"
-    cfg.parent.mkdir()
+    cfg = tmp_path / ".claude.json"
     cfg.write_text(contents)
     reg = _make_registrar(tmp_path, cli=None)
     assert reg.get_server("headroom") is None
+
+
+@pytest.mark.parametrize("mcp_servers", ["null", "[]", '"oops"'])
+def test_get_server_robust_to_non_dict_mcp_servers(tmp_path: Path, mcp_servers: str) -> None:
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(f'{{"mcpServers": {mcp_servers}}}')
+    reg = _make_registrar(tmp_path, cli=None)
+    assert reg.get_server("headroom") is None
+
+
+@pytest.mark.parametrize("mcp_servers", ["null", "[]", '"oops"'])
+def test_unregister_robust_to_non_dict_mcp_servers(tmp_path: Path, mcp_servers: str) -> None:
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(f'{{"mcpServers": {mcp_servers}}}')
+    reg = _make_registrar(tmp_path, cli=None)
+    assert reg.unregister_server("headroom") is False
+
+
+@pytest.mark.parametrize("mcp_servers", ["null", "[]", '"oops"'])
+def test_register_robust_to_non_dict_mcp_servers(tmp_path: Path, mcp_servers: str) -> None:
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(f'{{"mcpServers": {mcp_servers}}}')
+    reg = _make_registrar(tmp_path, cli=None)
+    result = reg.register_server(_spec())
+    assert result.status == RegisterStatus.REGISTERED
+    data = json.loads(cfg.read_text())
+    assert data["mcpServers"]["headroom"]["command"] == _RESOLVED_COMMAND[0]
+
+
+@pytest.mark.parametrize("contents", ["not json", "{", '{"projects": }', "[]"])
+def test_register_via_file_preserves_malformed_config(tmp_path: Path, contents: str) -> None:
+    """Registering must NOT clobber an existing but unparseable config.
+
+    ~/.claude.json holds unrelated Claude state (projects, oauthAccount,
+    session history). Before the fix a malformed file was read as {} and then
+    overwritten with only {"mcpServers": ...}, destroying everything else."""
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(contents, encoding="utf-8")
+    reg = _make_registrar(tmp_path, cli=None)
+
+    result = reg.register_server(_spec())
+
+    assert result.status == RegisterStatus.FAILED
+    assert "not valid JSON" in result.detail
+    # The original bytes are untouched — nothing was overwritten.
+    assert cfg.read_text(encoding="utf-8") == contents
+
+
+def test_non_utf8_config_fails_cleanly_and_is_left_untouched(tmp_path: Path) -> None:
+    """A ~/.claude.json saved in a non-UTF-8 locale encoding (GBK here) must not
+    crash register/unregister/validate with a raw UnicodeDecodeError; it is
+    treated as malformed and never rewritten."""
+    from headroom.mcp_registry.claude import ClaudeConfigMutationError
+
+    cfg = tmp_path / ".claude.json"
+    original = '{"projects": {"/项目": {}}}'.encode("gbk")
+    cfg.write_bytes(original)
+    reg = _make_registrar(tmp_path, cli=None)
+
+    result = reg.register_server(_spec())
+    assert result.status == RegisterStatus.FAILED
+    assert "not valid JSON" in result.detail
+    assert reg.unregister_server("headroom") is False
+    with pytest.raises(ClaudeConfigMutationError, match="not valid UTF-8"):
+        reg.validate_configs_for_mutation()
+    assert cfg.read_bytes() == original
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_failed_write_leaves_claude_json_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """~/.claude.json holds OAuth state; a write that fails mid-way (ENOSPC at
+    fsync here) must leave the original bytes and mode, and no temp file."""
+    cfg = tmp_path / ".claude.json"
+    original = json.dumps({"oauthAccount": {"emailAddress": "a@b.c"}, "mcpServers": {}})
+    cfg.write_text(original, encoding="utf-8")
+    cfg.chmod(0o600)
+    reg = _make_registrar(tmp_path, cli=None)
+
+    def no_space(fd: int) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("headroom.fsutil.os.fsync", no_space)
+    result = reg.register_server(_spec())
+    assert result.status == RegisterStatus.FAILED
+    assert "No space left" in result.detail
+
+    assert cfg.read_text(encoding="utf-8") == original
+    assert sorted(p.name for p in tmp_path.iterdir()) == [".claude.json"]
+
+    monkeypatch.undo()
+    assert reg.register_server(_spec()).status == RegisterStatus.REGISTERED
+    assert stat.S_IMODE(cfg.stat().st_mode) == 0o600
+    assert json.loads(cfg.read_text(encoding="utf-8"))["oauthAccount"]
+
+
+def test_register_via_file_merges_into_existing_valid_config(tmp_path: Path) -> None:
+    """The happy path still merges: unrelated keys are preserved and mcpServers
+    gains the headroom entry."""
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(
+        json.dumps({"projects": {"/x": {"y": 1}}, "oauthAccount": {"id": "abc"}}),
+        encoding="utf-8",
+    )
+    reg = _make_registrar(tmp_path, cli=None)
+
+    result = reg.register_server(_spec())
+
+    assert result.status == RegisterStatus.REGISTERED
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    assert data["projects"] == {"/x": {"y": 1}}
+    assert data["oauthAccount"] == {"id": "abc"}
+    assert "headroom" in data["mcpServers"]
+
+
+# ----------------------------------------------------------------------
+# Project ("local") scope — issue #2787
+#
+# A server registered at user scope loads in every Claude Code session on the
+# machine, so one that fails to start breaks unrelated projects. Project scope
+# confines it to the directory that was wrapped.
+# ----------------------------------------------------------------------
+
+_SERENA_ARGS = ["serena", "start-mcp-server"]
+
+
+def _local_registrar(
+    tmp_path: Path,
+    *,
+    cli: str | None = None,
+    project_dir: Path | None = None,
+) -> ClaudeRegistrar:
+    """Registrar writing project scope, pointed at ``tmp_path`` as $HOME."""
+    return ClaudeRegistrar(
+        claude_cli=cli,
+        home_dir=tmp_path,
+        scope=SCOPE_LOCAL,
+        project_dir=project_dir if project_dir is not None else tmp_path / "proj",
+    )
+
+
+def _serena_spec(command: str = "uvx") -> ServerSpec:
+    return ServerSpec(name="serena", command=command, args=tuple(_SERENA_ARGS))
+
+
+def test_rejects_unknown_scope(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        ClaudeRegistrar(claude_cli=None, home_dir=tmp_path, scope="global")
+
+
+def test_register_local_scope_writes_project_map_not_user_map(tmp_path: Path) -> None:
+    project = tmp_path / "proj"
+    reg = _local_registrar(tmp_path, project_dir=project)
+
+    result = reg.register_server(_serena_spec())
+
+    assert result.status == RegisterStatus.REGISTERED
+    data = json.loads((tmp_path / ".claude.json").read_text(encoding="utf-8"))
+    assert "serena" in data["projects"][project.as_posix()]["mcpServers"]
+    # The machine-wide map is what breaks unrelated sessions — stay out of it.
+    assert "mcpServers" not in data
+
+
+def test_register_local_scope_reuses_existing_project_key(tmp_path: Path) -> None:
+    """Claude Code keys ``projects`` by the session's cwd string (forward slashes
+    even on Windows). A second key naming the same directory would leave an entry
+    Claude Code never reads."""
+    project = tmp_path / "proj"
+    cfg = tmp_path / ".claude.json"
+    existing_key = project.as_posix() + "/"  # same directory, different spelling
+    cfg.write_text(
+        json.dumps({"projects": {existing_key: {"hasTrustDialogAccepted": True}}}),
+        encoding="utf-8",
+    )
+    reg = _local_registrar(tmp_path, project_dir=project)
+
+    assert reg.register_server(_serena_spec()).status == RegisterStatus.REGISTERED
+
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    assert list(data["projects"]) == [existing_key]
+    assert "serena" in data["projects"][existing_key]["mcpServers"]
+    assert data["projects"][existing_key]["hasTrustDialogAccepted"] is True
+
+
+def test_register_local_scope_writes_even_when_user_entry_matches(tmp_path: Path) -> None:
+    """A leftover user-scope copy must not make the project-scope registration
+    look like a no-op — that would leave the machine-wide entry as the only one."""
+    project = tmp_path / "proj"
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(
+        json.dumps({"mcpServers": {"serena": {"command": "uvx", "args": _SERENA_ARGS}}}),
+        encoding="utf-8",
+    )
+    reg = _local_registrar(tmp_path, project_dir=project)
+
+    result = reg.register_server(_serena_spec())
+
+    assert result.status == RegisterStatus.REGISTERED
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    assert "serena" in data["projects"][project.as_posix()]["mcpServers"]
+    # Retiring the global copy is wrap's job (ledger-gated), not the registrar's.
+    assert "serena" in data["mcpServers"]
+
+
+def test_register_local_scope_never_writes_legacy_config(tmp_path: Path) -> None:
+    """``~/.claude/mcp.json`` has no projects map, so project scope always goes to
+    the modern config even when only the legacy file exists."""
+    legacy = tmp_path / ".claude" / "mcp.json"
+    legacy.parent.mkdir()
+    legacy.write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
+    project = tmp_path / "proj"
+    reg = _local_registrar(tmp_path, project_dir=project)
+
+    assert reg.register_server(_serena_spec()).status == RegisterStatus.REGISTERED
+
+    assert json.loads(legacy.read_text(encoding="utf-8"))["mcpServers"] == {}
+    data = json.loads((tmp_path / ".claude.json").read_text(encoding="utf-8"))
+    assert "serena" in data["projects"][project.as_posix()]["mcpServers"]
+
+
+def test_register_via_cli_passes_local_scope_and_project_cwd(tmp_path: Path) -> None:
+    project = tmp_path / "proj"
+    reg = _local_registrar(tmp_path, cli="/usr/local/bin/claude", project_dir=project)
+    ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    with patch("subprocess.run", return_value=ok) as run_mock:
+        result = reg.register_server(_serena_spec())
+
+    assert result.status == RegisterStatus.REGISTERED
+    add_call = run_mock.call_args
+    assert add_call is not None
+    assert add_call.args[0][:6] == [
+        "/usr/local/bin/claude",
+        "mcp",
+        "add",
+        "serena",
+        "-s",
+        "local",
+    ]
+    # `claude mcp add -s local` keys the entry by the CLI process's own cwd.
+    assert add_call.kwargs["cwd"] == str(project)
+
+
+def test_get_server_prefers_project_entry_over_user_entry(tmp_path: Path) -> None:
+    """Claude Code resolves project scope first, so our reads must too."""
+    project = tmp_path / "proj"
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "mcpServers": {"serena": {"command": "global-uvx"}},
+                "projects": {project.as_posix(): {"mcpServers": {"serena": {"command": "uvx"}}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    reg = _local_registrar(tmp_path, project_dir=project)
+
+    unscoped = reg.get_server("serena")
+    assert unscoped is not None and unscoped.command == "uvx"
+
+    scoped_user = reg.get_server("serena", scope=SCOPE_USER)
+    assert scoped_user is not None and scoped_user.command == "global-uvx"
+
+    scoped_local = reg.get_server("serena", scope=SCOPE_LOCAL)
+    assert scoped_local is not None and scoped_local.command == "uvx"
+
+
+def test_get_server_scoped_read_ignores_other_projects(tmp_path: Path) -> None:
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(
+        json.dumps(
+            {"projects": {(tmp_path / "elsewhere").as_posix(): {"mcpServers": {"serena": {}}}}}
+        ),
+        encoding="utf-8",
+    )
+    reg = _local_registrar(tmp_path, project_dir=tmp_path / "proj")
+
+    assert reg.get_server("serena", scope=SCOPE_LOCAL) is None
+
+
+def test_force_register_local_scope_leaves_user_entry(tmp_path: Path) -> None:
+    """force=True replaces the entry in the target scope only.
+
+    Overwriting this project's Serena must not delete a machine-wide one the
+    user registered themselves.
+    """
+    project = tmp_path / "proj"
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "mcpServers": {"serena": {"command": "user-managed-serena"}},
+                "projects": {project.as_posix(): {"mcpServers": {"serena": {"command": "old"}}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    reg = _local_registrar(tmp_path, project_dir=project)
+
+    result = reg.register_server(_serena_spec(), force=True)
+
+    assert result.status == RegisterStatus.REGISTERED
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    assert data["projects"][project.as_posix()]["mcpServers"]["serena"]["command"] == "uvx"
+    assert data["mcpServers"]["serena"]["command"] == "user-managed-serena"
+
+
+def test_unregister_removes_both_scopes_by_default(tmp_path: Path) -> None:
+    """unwrap must clean up regardless of which scope installed the entry."""
+    project = tmp_path / "proj"
+    other = tmp_path / "other"
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "mcpServers": {"serena": {"command": "uvx"}},
+                "projects": {
+                    project.as_posix(): {"mcpServers": {"serena": {"command": "uvx"}}},
+                    other.as_posix(): {"mcpServers": {"serena": {"command": "uvx"}}},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    reg = _local_registrar(tmp_path, project_dir=project)
+
+    assert reg.unregister_server("serena") is True
+
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    assert data["mcpServers"] == {}
+    assert data["projects"][project.as_posix()]["mcpServers"] == {}
+    # Other projects were wrapped separately; unwrapping here must not touch them.
+    assert "serena" in data["projects"][other.as_posix()]["mcpServers"]
+
+
+def test_unregister_user_scope_leaves_project_entry(tmp_path: Path) -> None:
+    project = tmp_path / "proj"
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "mcpServers": {"serena": {"command": "uvx"}},
+                "projects": {project.as_posix(): {"mcpServers": {"serena": {"command": "uvx"}}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    reg = _local_registrar(tmp_path, project_dir=project)
+
+    assert reg.unregister_server("serena", scope=SCOPE_USER) is True
+
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    assert data["mcpServers"] == {}
+    assert "serena" in data["projects"][project.as_posix()]["mcpServers"]
+
+
+def test_default_scope_is_user_so_existing_callers_are_unchanged(tmp_path: Path) -> None:
+    reg = _make_registrar(tmp_path, cli=None)
+    assert reg.scope == SCOPE_USER
+
+    assert reg.register_server(_spec()).status == RegisterStatus.REGISTERED
+
+    data = json.loads((tmp_path / ".claude.json").read_text(encoding="utf-8"))
+    assert "headroom" in data["mcpServers"]
+    assert "projects" not in data
+
+
+# get_plugin_servers() — servers bundled by Claude Code plugins (#3570)
+# ----------------------------------------------------------------------
+
+_ISSUE_3570 = json.loads(
+    (Path(__file__).parents[1] / "fixtures" / "headroom-issue-3570.json").read_text()
+)
+_PLUGIN_ID = _ISSUE_3570["plugin_id"]
+_PLUGIN_SERENA_ARGS = tuple(_ISSUE_3570["plugin_mcp_json"]["serena"]["args"])
+
+
+@pytest.fixture
+def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Isolated ``$HOME`` that is also the working directory (no project settings)."""
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
+def _install_plugin(
+    claude_dir: Path,
+    *,
+    plugin_id: str = _PLUGIN_ID,
+    mcp_json: str | None = None,
+    enabled: bool | None = True,
+    records: list[dict] | None = None,
+) -> Path:
+    """Lay out a plugin the way ``claude plugin install`` does under ``claude_dir``.
+
+    Returns the plugin's install path. ``mcp_json`` overrides the raw
+    ``.mcp.json`` text (``None`` writes the fixture's flat-map form).
+    ``enabled`` is written to the user ``settings.json``; ``None`` writes no
+    ``enabledPlugins`` entry at all.
+    """
+    install_path = claude_dir / "plugins" / "cache" / "market" / plugin_id / "v1"
+    install_path.mkdir(parents=True, exist_ok=True)
+    if mcp_json is None:
+        mcp_json = json.dumps(_ISSUE_3570["plugin_mcp_json"])
+    (install_path / ".mcp.json").write_text(mcp_json, encoding="utf-8")
+
+    registry = claude_dir / "plugins" / "installed_plugins.json"
+    installed = (
+        json.loads(registry.read_text()) if registry.exists() else {"version": 2, "plugins": {}}
+    )
+    if records is None:
+        record = dict(_ISSUE_3570["installed_plugins_json"]["plugins"][_PLUGIN_ID][0])
+        record["installPath"] = str(install_path)
+        records = [record]
+    installed["plugins"][plugin_id] = records
+    registry.write_text(json.dumps(installed), encoding="utf-8")
+
+    if enabled is not None:
+        _set_enabled(claude_dir / "settings.json", enabled, plugin_id=plugin_id)
+    return install_path
+
+
+def _set_enabled(settings: Path, enabled: bool, *, plugin_id: str = _PLUGIN_ID) -> None:
+    """Write ``enabledPlugins[plugin_id]`` into a Claude settings file."""
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    data = json.loads(settings.read_text()) if settings.exists() else {}
+    data.setdefault("enabledPlugins", {})[plugin_id] = enabled
+    settings.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _project_scoped_record(install_path: Path, project: Path) -> dict:
+    record = dict(_ISSUE_3570["project_scoped_record"])
+    record["installPath"] = str(install_path)
+    record["projectPath"] = str(project)
+    return record
+
+
+def _plugin_ids(reg: ClaudeRegistrar) -> list[str]:
+    return [plugin_id for plugin_id, _ in reg.get_plugin_servers("serena")]
+
+
+def test_get_plugin_servers_empty_without_plugins(home: Path) -> None:
+    reg = _make_registrar(home, cli=None)
+    assert reg.get_plugin_servers("serena") == []
+
+
+def test_get_plugin_servers_sees_serena_that_get_server_cannot(home: Path) -> None:
+    _install_plugin(home / ".claude")
+    reg = _make_registrar(home, cli=None)
+
+    assert reg.get_server("serena") is None
+    assert reg.get_plugin_servers("serena") == [
+        (_PLUGIN_ID, ServerSpec(name="serena", command="uvx", args=_PLUGIN_SERENA_ARGS))
+    ]
+
+
+def test_get_plugin_servers_reads_mcp_servers_wrapped_shape(home: Path) -> None:
+    wrapped = json.dumps({"mcpServers": _ISSUE_3570["plugin_mcp_json"]})
+    _install_plugin(home / ".claude", mcp_json=wrapped)
+    reg = _make_registrar(home, cli=None)
+
+    got = reg.get_plugin_servers("serena")
+
+    assert [plugin_id for plugin_id, _ in got] == [_PLUGIN_ID]
+    assert got[0][1].args == _PLUGIN_SERENA_ARGS
+
+
+def test_get_plugin_servers_skips_disabled_plugin(home: Path) -> None:
+    """``claude plugin disable`` keeps the install record and flips the flag."""
+    _install_plugin(home / ".claude", enabled=False)
+    reg = _make_registrar(home, cli=None)
+    assert reg.get_plugin_servers("serena") == []
+
+
+@pytest.mark.parametrize(
+    "settings", [None, "{}", '{"enabledPlugins": null}', '{"enabledPlugins": {}}', "not json"]
+)
+def test_get_plugin_servers_requires_an_explicit_enable(home: Path, settings: str | None) -> None:
+    """An installed plugin with no ``enabledPlugins`` entry anywhere is not launched."""
+    claude_dir = home / ".claude"
+    _install_plugin(claude_dir, enabled=None)
+    if settings is not None:
+        (claude_dir / "settings.json").write_text(settings, encoding="utf-8")
+    reg = _make_registrar(home, cli=None)
+    assert reg.get_plugin_servers("serena") == []
+
+
+def test_get_plugin_servers_project_install_reports_inside_its_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``--scope project`` install is enabled by the project's own settings only."""
+    claude_dir = tmp_path / ".claude"
+    project = tmp_path / "proj"
+    install_path = claude_dir / "plugins" / "cache" / "market" / _PLUGIN_ID / "v1"
+    _install_plugin(
+        claude_dir, enabled=None, records=[_project_scoped_record(install_path, project)]
+    )
+    _set_enabled(project / ".claude" / "settings.json", True)
+    reg = _make_registrar(tmp_path, cli=None)
+
+    monkeypatch.chdir(project)
+    assert _plugin_ids(reg) == [_PLUGIN_ID]
+
+
+def test_get_plugin_servers_project_install_is_quiet_outside_its_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    claude_dir = tmp_path / ".claude"
+    project = tmp_path / "proj"
+    install_path = claude_dir / "plugins" / "cache" / "market" / _PLUGIN_ID / "v1"
+    _install_plugin(
+        claude_dir, enabled=None, records=[_project_scoped_record(install_path, project)]
+    )
+    _set_enabled(project / ".claude" / "settings.json", True)
+    reg = _make_registrar(tmp_path, cli=None)
+
+    for elsewhere in (tmp_path, tmp_path / "other", project / "sub"):
+        elsewhere.mkdir(exist_ok=True)
+        monkeypatch.chdir(elsewhere)
+        assert reg.get_plugin_servers("serena") == [], elsewhere
+
+
+def test_get_plugin_servers_project_disable_silences_user_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``claude plugin disable`` run inside a project writes the project scope."""
+    _install_plugin(tmp_path / ".claude", enabled=True)
+    project = tmp_path / "proj"
+    _set_enabled(project / ".claude" / "settings.json", False)
+    reg = _make_registrar(tmp_path, cli=None)
+
+    monkeypatch.chdir(project)
+    assert reg.get_plugin_servers("serena") == []
+    monkeypatch.chdir(tmp_path)
+    assert _plugin_ids(reg) == [_PLUGIN_ID]
+
+
+def test_get_plugin_servers_project_enable_overrides_user_disable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_plugin(tmp_path / ".claude", enabled=False)
+    project = tmp_path / "proj"
+    _set_enabled(project / ".claude" / "settings.json", True)
+    reg = _make_registrar(tmp_path, cli=None)
+
+    monkeypatch.chdir(project)
+    assert _plugin_ids(reg) == [_PLUGIN_ID]
+
+
+@pytest.mark.parametrize("local", [False, True])
+def test_get_plugin_servers_local_settings_override_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, local: bool
+) -> None:
+    _install_plugin(tmp_path / ".claude", enabled=None)
+    project = tmp_path / "proj"
+    _set_enabled(project / ".claude" / "settings.json", not local)
+    _set_enabled(project / ".claude" / "settings.local.json", local)
+    reg = _make_registrar(tmp_path, cli=None)
+
+    monkeypatch.chdir(project)
+    assert _plugin_ids(reg) == ([_PLUGIN_ID] if local else [])
+
+
+def test_get_plugin_servers_reports_each_plugin_once(home: Path) -> None:
+    claude_dir = home / ".claude"
+    install_path = claude_dir / "plugins" / "cache" / "market" / _PLUGIN_ID / "v1"
+    _install_plugin(
+        claude_dir,
+        records=[
+            {"scope": "user", "installPath": str(install_path)},
+            _project_scoped_record(install_path, home),
+        ],
+    )
+    reg = _make_registrar(home, cli=None)
+    assert _plugin_ids(reg) == [_PLUGIN_ID]
+
+
+def test_get_plugin_servers_reports_every_plugin_in_registry_order(home: Path) -> None:
+    claude_dir = home / ".claude"
+    _install_plugin(claude_dir, plugin_id="serena@other")
+    _install_plugin(claude_dir)
+    reg = _make_registrar(home, cli=None)
+    got = reg.get_plugin_servers("serena")
+    assert [plugin_id for plugin_id, _ in got] == ["serena@other", _PLUGIN_ID]
+    assert all(spec.args == _PLUGIN_SERENA_ARGS for _, spec in got)
+
+
+def test_get_plugin_servers_matches_only_the_requested_name(home: Path) -> None:
+    _install_plugin(home / ".claude")
+    reg = _make_registrar(home, cli=None)
+    assert reg.get_plugin_servers("headroom") == []
+
+
+def test_get_plugin_servers_reads_explicit_config_dir(home: Path) -> None:
+    config_dir = home / "relocated"
+    _install_plugin(config_dir)
+    _install_plugin(home / ".claude", plugin_id="serena@home")
+    reg = ClaudeRegistrar(claude_cli=None, home_dir=home, config_dir=config_dir)
+    assert _plugin_ids(reg) == [_PLUGIN_ID]
+
+
+def test_get_plugin_servers_reads_claude_config_dir_env(
+    monkeypatch: pytest.MonkeyPatch, home: Path
+) -> None:
+    config_dir = home / "relocated"
+    _install_plugin(config_dir)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    monkeypatch.setattr(Path, "home", lambda: home)
+    reg = ClaudeRegistrar(claude_cli=None)
+    assert _plugin_ids(reg) == [_PLUGIN_ID]
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "",
+        "not json",
+        "[]",
+        '{"plugins": []}',
+        '{"plugins": {"x": {}}}',
+        '{"plugins": {"x": [null]}}',
+        '{"plugins": {"x": [{}]}}',
+        '{"plugins": {"x": [{"installPath": ""}]}}',
+        '{"plugins": {"x": [{"installPath": 5}]}}',
+    ],
+)
+def test_get_plugin_servers_robust_to_bad_registry(home: Path, contents: str) -> None:
+    registry = home / ".claude" / "plugins" / "installed_plugins.json"
+    registry.parent.mkdir(parents=True)
+    registry.write_text(contents, encoding="utf-8")
+    _set_enabled(home / ".claude" / "settings.json", True, plugin_id="x")
+    reg = _make_registrar(home, cli=None)
+    assert reg.get_plugin_servers("serena") == []
+
+
+@pytest.mark.parametrize(
+    "mcp_json",
+    ["", "not json", "[]", '{"mcpServers": []}', '{"serena": "oops"}', '{"other": {}}'],
+)
+def test_get_plugin_servers_robust_to_bad_plugin_mcp_json(home: Path, mcp_json: str) -> None:
+    _install_plugin(home / ".claude", mcp_json=mcp_json)
+    reg = _make_registrar(home, cli=None)
+    assert reg.get_plugin_servers("serena") == []
+
+
+def test_get_plugin_servers_tolerates_missing_install_path(home: Path) -> None:
+    _install_plugin(
+        home / ".claude",
+        records=[{"scope": "user", "installPath": str(home / "gone")}],
+    )
+    reg = _make_registrar(home, cli=None)
+    assert reg.get_plugin_servers("serena") == []

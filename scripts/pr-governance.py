@@ -22,6 +22,7 @@ REQUIRED_SECTIONS = (
     "Changes Made",
     "Testing",
     "Real Behavior Proof",
+    "Runtime Rollout Safety",
     "Review Readiness",
 )
 PROOF_FIELDS = (
@@ -30,6 +31,37 @@ PROOF_FIELDS = (
     "Observed result",
     "Not tested",
 )
+ROLLOUT_FIELDS = (
+    "Rollout-managed feature(s)",
+    "Minimum rollout channel",
+    "Stable/default behavior changed",
+    "Kill switch / disable path",
+    "Unsafe override required",
+    "Qualification impact",
+    "Rollback path",
+)
+
+# Conventional-commit types accepted by .commitlintrc.json. Keep the two in
+# sync: commitlint gates the *commits* on a PR, but the repo squash-merges, so
+# it is the PR *title* that becomes the subject line on main.
+COMMIT_TYPES = (
+    "build",
+    "chore",
+    "ci",
+    "deps",
+    "docs",
+    "feat",
+    "fix",
+    "parity",
+    "perf",
+    "refactor",
+    "revert",
+    "style",
+    "test",
+)
+
+# type(optional-scope)!: subject
+TITLE_RE = re.compile(rf"^(?:{'|'.join(COMMIT_TYPES)})(?:\([^)]+\))?!?: .+")
 
 SECTION_RE = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
 CHECKBOX_RE = re.compile(r"^- \[(?P<checked>[ xX])\] (?P<label>.+)$", re.MULTILINE)
@@ -142,6 +174,9 @@ def validate_pull_request(event: dict[str, Any]) -> GovernanceReport:
     is_draft = bool(pull_request.get("draft", False))
     is_bot_pr = author.endswith("[bot]")
     body = pull_request.get("body") or ""
+    # Normalize Windows line endings so regex patterns expecting \n
+    # (particularly the code-block fence regex) match correctly.
+    body = body.replace("\r\n", "\n")
 
     if is_bot_pr:
         summary = "### PR governance\n\nBot-authored PR detected; template enforcement is skipped."
@@ -158,6 +193,19 @@ def validate_pull_request(event: dict[str, Any]) -> GovernanceReport:
 
     sections = extract_sections(body)
     problems: list[str] = []
+
+    # A squash-merge uses the PR title as the commit subject on main, and
+    # release-please parses those subjects. One unparseable title stops it
+    # building a release PR at all, and the change is silently dropped from the
+    # changelog either way. commitlint cannot catch this: it lints the commits
+    # inside the PR, not the title that replaces them.
+    title = (pull_request.get("title") or "").strip()
+    if not TITLE_RE.match(title):
+        problems.append(
+            f"PR title must be a Conventional Commit — `type(scope): subject` — because "
+            f"squash-merge makes it the commit subject on `main` and release-please parses it. "
+            f"Got: `{title or '(empty)'}`. Valid types: {', '.join(f'`{t}`' for t in COMMIT_TYPES)}."
+        )
 
     for section_name in REQUIRED_SECTIONS:
         if section_name not in sections:
@@ -189,6 +237,12 @@ def validate_pull_request(event: dict[str, Any]) -> GovernanceReport:
     for field_name in PROOF_FIELDS:
         if proof_section and not proof_values.get(field_name):
             problems.append(f"Fill in `Real Behavior Proof` → `{field_name}`.")
+
+    rollout_section = sections.get("Runtime Rollout Safety", "")
+    rollout_values = proof_field_values(rollout_section)
+    for field_name in ROLLOUT_FIELDS:
+        if rollout_section and not rollout_values.get(field_name):
+            problems.append(f"Fill in `Runtime Rollout Safety` → `{field_name}`.")
 
     readiness_checked = normalize_checkbox_map(checked_items(sections.get("Review Readiness", "")))
     has_self_review = "i have performed a self-review" in readiness_checked
@@ -258,6 +312,24 @@ def validate_pull_request(event: dict[str, Any]) -> GovernanceReport:
     )
 
 
+def validate_pull_request_body(event: dict[str, Any], body: str | None = None) -> GovernanceReport:
+    """Validate a PR event, optionally replacing the event payload body.
+
+    GitHub reruns use the original event payload. That makes a governance rerun
+    keep validating an old PR body even after maintainers fix the live body.
+    The workflow fetches the current body via the API and passes it here so the
+    check reflects what reviewers see on the PR page.
+    """
+    if body is None:
+        return validate_pull_request(event)
+
+    event_copy = dict(event)
+    pull_request = dict(event["pull_request"])
+    pull_request["body"] = body
+    event_copy["pull_request"] = pull_request
+    return validate_pull_request(event_copy)
+
+
 def emit_outputs(report: GovernanceReport) -> None:
     output_path = os.environ.get("GITHUB_OUTPUT")
     lines = [
@@ -281,13 +353,24 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--event", type=Path, required=True, help="Path to the GitHub event payload JSON."
     )
+    parser.add_argument(
+        "--body-file",
+        type=Path,
+        help=(
+            "Optional file containing the current PR body. Use this in GitHub Actions "
+            "so reruns validate the live PR body instead of the stale event payload."
+        ),
+    )
     parser.add_argument("--report", type=Path, required=True, help="Path to write the JSON report.")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
-    report = validate_pull_request(load_event(args.event))
+    body_override = (
+        args.body_file.read_text(encoding="utf-8") if args.body_file is not None else None
+    )
+    report = validate_pull_request_body(load_event(args.event), body_override)
     args.report.write_text(json.dumps(report.to_dict(), indent=2), encoding="utf-8")
     emit_outputs(report)
     return 0

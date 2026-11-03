@@ -11,7 +11,6 @@ from unittest.mock import MagicMock, patch
 import anyio
 import pytest
 
-import headroom.proxy.handlers.openai as openai_handler
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin
 
 
@@ -38,6 +37,7 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
             retry_base_delay_ms=1,
             retry_max_delay_ms=1,
             connect_timeout_seconds=10,
+            openai_extra_headers=None,
         )
         self.usage_reporter = None
         self.openai_provider = SimpleNamespace(get_context_limit=lambda model: 128_000)
@@ -45,9 +45,34 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
         self.anthropic_backend = None
         self.cost_tracker = None
         self.memory_handler = None
+        self.traffic_learner = None
 
     async def _next_request_id(self) -> str:
         return "req-ws-test"
+
+
+class _MemoryToolsOnlyHandler:
+    def __init__(self) -> None:
+        self.config = SimpleNamespace(
+            inject_context=False,
+            inject_tools=True,
+            project_root_override="",
+        )
+        self.compute_calls = 0
+
+    def compute_memory_tool_definitions(self, provider: str) -> list[dict]:
+        self.compute_calls += 1
+        assert provider == "openai"
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "memory_search",
+                    "description": "Search memory.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
 
 
 class _FakeWebSocket:
@@ -225,6 +250,44 @@ def test_codex_ws_happy_path_emits_all_stage_timings(stage_log_capture):
     assert "total_session" in emitted
 
 
+def test_codex_ws_chatgpt_auth_skips_memory_tools(stage_log_capture):
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "resp_1"}}),
+        json.dumps({"type": "response.completed", "response": {"id": "resp_1"}}),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+
+    first_frame = json.dumps(
+        {
+            "type": "response.create",
+            "response": {"model": "gpt-5.4", "input": "hello", "store": True},
+        }
+    )
+    client_ws = _FakeWebSocket(
+        frames=[first_frame],
+        headers={
+            "authorization": "Bearer chatgpt-session-token",
+            "chatgpt-account-id": "acct_123",
+            "x-headroom-user-id": "user-1",
+        },
+    )
+    handler = _DummyOpenAIHandler()
+    memory_handler = _MemoryToolsOnlyHandler()
+    handler.memory_handler = memory_handler
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        anyio.run(handler.handle_openai_responses_ws, client_ws)
+
+    assert len(upstream.sent) == 1
+    sent = json.loads(upstream.sent[0])
+    response_body = sent["response"]
+    assert response_body["store"] is False
+    assert "tools" not in response_body
+    assert "## Memory" not in response_body.get("instructions", "")
+    assert memory_handler.compute_calls == 0
+
+
 def test_codex_ws_upstream_connect_failure_still_logs_timings(stage_log_capture):
     """A session that never connects upstream still logs a timing line
     with ``upstream_first_event`` absent (null)."""
@@ -286,21 +349,3 @@ def test_codex_ws_request_id_and_session_id_present_in_log(stage_log_capture):
     assert payload["request_id"] == "req-ws-test"
     assert isinstance(payload["session_id"], str)
     assert len(payload["session_id"]) >= 16
-
-
-def test_codex_compression_debug_noop_skips_expensive_payload_debug(monkeypatch):
-    handler = _DummyOpenAIHandler()
-
-    def _fail_context_budget(_payload):
-        raise AssertionError("debug context budget should not be built")
-
-    monkeypatch.setattr(openai_handler, "_openai_responses_context_budget", _fail_context_budget)
-
-    result = handler._compress_openai_responses_payload(
-        {"model": "gpt-5.4", "input": "hello"},
-        model="gpt-5.4",
-        request_id="req-ws-test",
-    )
-
-    assert result[1] is False
-    assert result[4] == "router_no_compression"

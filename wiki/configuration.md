@@ -2,6 +2,26 @@
 
 Headroom can be configured via the SDK, proxy command line, or per-request overrides.
 
+## Runtime Rollout Channels
+
+Rollout channels control behaviors in an already-installed artifact. They do
+not install or select a Headroom release/version.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `HEADROOM_ROLLOUT_CHANNEL` | `stable` | Selects `stable`, `beta`, `canary`, or `dev`. |
+| `HEADROOM_FEATURES` | unset | Comma-separated feature names to request explicitly. |
+| `HEADROOM_DISABLE_FEATURES` | unset | Comma-separated feature names to force off. Disable wins over every enable path. |
+| `HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES` | unset | Break-glass override for emergency mitigation only. |
+
+Example:
+
+```bash
+export HEADROOM_ROLLOUT_CHANNEL=canary
+export HEADROOM_FEATURES=tool_result_interceptors
+headroom proxy --intercept-tool-results
+```
+
 ## SDK Configuration
 
 ```python
@@ -11,22 +31,17 @@ from openai import OpenAI
 client = HeadroomClient(
     original_client=OpenAI(),
     provider=OpenAIProvider(),
-
     # Mode: "audit" (observe only) or "optimize" (apply transforms)
     default_mode="optimize",
-
     # Enable provider-specific cache optimization
     enable_cache_optimizer=True,
-
     # Enable query-level semantic caching
     enable_semantic_cache=False,
-
     # Override default context limits per model
     model_context_limits={
         "gpt-4o": 128000,
         "gpt-4o-mini": 128000,
     },
-
     # Database location (defaults to temp directory)
     # store_url="sqlite:////absolute/path/to/headroom.db",
 )
@@ -39,7 +54,7 @@ client = HeadroomClient(
 ```bash
 headroom proxy \
   --port 8787 \              # Port to listen on
-  --host 0.0.0.0 \           # Host to bind to
+  --host 127.0.0.1 \         # Host to bind to
   --budget 10.00 \           # Daily budget limit in USD
   --log-file headroom.jsonl  # Log file path
 ```
@@ -53,11 +68,11 @@ headroom proxy --no-optimize
 # Disable semantic caching
 headroom proxy --no-cache
 
-# Disable CCR response handling
-headroom proxy --no-ccr-responses
+# Disable CCR entirely (no retrieval markers and no injected retrieve tool)
+headroom proxy --no-ccr
 
-# Disable proactive expansion
-headroom proxy --no-ccr-expansion
+# Disable proactive CCR expansion
+headroom proxy --no-ccr-proactive-expansion
 
 # (The earlier --llmlingua flag was retired in 0.9.x and replaced by
 # Kompress (ModernBERT). See `wiki/transforms.md` for the current
@@ -116,20 +131,14 @@ Override configuration for specific requests:
 response = client.chat.completions.create(
     model="gpt-4o",
     messages=[...],
-
     # Override mode for this request
     headroom_mode="audit",
-
     # Reserve more tokens for output
     headroom_output_buffer_tokens=8000,
-
     # Keep last N turns (don't compress)
     headroom_keep_turns=5,
-
     # Skip compression for specific tools
-    headroom_tool_profiles={
-        "important_tool": {"skip_compression": True}
-    }
+    headroom_tool_profiles={"important_tool": {"skip_compression": True}},
 )
 ```
 
@@ -166,16 +175,16 @@ from headroom.transforms import SmartCrusherConfig
 config = SmartCrusherConfig(
     # Maximum items to keep after compression
     max_items_after_crush=15,
-
     # Minimum tokens before applying compression
     min_tokens_to_crush=200,
-
-    # Relevance scoring tier: "bm25" (fast) or "embedding" (accurate)
-    relevance_tier="bm25",
-
-    # Always keep items with these field values
-    preserve_fields=["error", "warning", "failure"],
+    # Guarantee rows matching these patterns survive compression verbatim
+    # (requires audit_safe=True; matched against each row's canonical JSON)
+    audit_safe=True,
+    protected_patterns=["error", "warning", "failure"],
 )
+# Error items and statistical anomalies (>2 std from mean) are always kept
+# automatically. Relevance-scoring tier ("bm25"/"embedding"/"hybrid") is a
+# separate `relevance_config` argument to SmartCrusher(), not a field here.
 ```
 
 ## Cache Aligner Configuration
@@ -183,121 +192,39 @@ config = SmartCrusherConfig(
 Control prefix stabilization:
 
 ```python
-from headroom.transforms import CacheAlignerConfig
+from headroom import CacheAlignerConfig
 
 config = CacheAlignerConfig(
-    # Enable/disable cache alignment
+    # Enable/disable cache alignment (disabled by default: prefix-stability
+    # gains are marginal in practice -- see headroom/config.py:61)
     enabled=True,
-
-    # Patterns to extract from system prompt
-    dynamic_patterns=[
+    # Legacy pattern list (only used when use_dynamic_detector=False;
+    # the field is `date_patterns`, not `dynamic_patterns`). Default mode
+    # (use_dynamic_detector=True) auto-detects dates, UUIDs, tokens, etc.
+    # via detection_tiers instead -- see headroom/config.py:68-79.
+    use_dynamic_detector=False,
+    date_patterns=[
         r"Today is \w+ \d+, \d{4}",
         r"Current time: .*",
     ],
 )
 ```
 
-## Rolling Window Configuration
+## Context Management
 
-Control context window management:
+Context management is handled automatically inside the pipeline
+(live-zone-only compression) — there is nothing to configure. Headroom
+**never** drops messages from the conversation history and does not do
+position-based or score-based context management. It compresses only the
+newest content blocks (the latest user message and the latest tool result /
+tool output), type-aware and reversible via CCR. The cache hot zone — system
+prompt, tools, and older turns — is never mutated, which preserves provider
+prompt caching.
 
-```python
-from headroom.transforms import RollingWindowConfig
-
-config = RollingWindowConfig(
-    # Minimum turns to always keep
-    min_keep_turns=3,
-
-    # Reserve tokens for output
-    output_buffer_tokens=4000,
-
-    # Drop oldest tool outputs first
-    prefer_drop_tool_outputs=True,
-)
-```
-
-## Intelligent Context Manager Configuration
-
-For semantic-aware context management with importance scoring:
-
-```python
-from headroom.config import IntelligentContextConfig, ScoringWeights
-
-# Customize scoring weights (must sum to 1.0, or will be normalized)
-weights = ScoringWeights(
-    recency=0.20,              # Newer messages score higher
-    semantic_similarity=0.20,  # Similarity to recent context
-    toin_importance=0.25,      # TOIN-learned retrieval patterns
-    error_indicator=0.15,      # TOIN-learned error field types
-    forward_reference=0.15,    # Messages referenced by later messages
-    token_density=0.05,        # Information density
-)
-
-config = IntelligentContextConfig(
-    # Enable/disable the manager
-    enabled=True,
-
-    # Protection settings
-    keep_system=True,           # Never drop system messages
-    keep_last_turns=2,          # Protect last N user turns
-
-    # Token budget
-    output_buffer_tokens=4000,  # Reserve for model output
-
-    # Scoring settings
-    use_importance_scoring=True,    # Use semantic scoring (vs position-only)
-    scoring_weights=weights,        # Custom weights
-    toin_integration=True,          # Use TOIN patterns if available
-    recency_decay_rate=0.1,         # Exponential decay lambda
-
-    # Strategy thresholds
-    compress_threshold=0.1,     # Try compression first if <10% over budget
-)
-```
-
-### CCR Integration
-
-When IntelligentContext drops messages, they're stored in CCR for potential retrieval:
-
-```python
-from headroom.telemetry import get_toin
-
-# Pass TOIN for bidirectional integration
-toin = get_toin()
-manager = IntelligentContextManager(config=config, toin=toin)
-
-# Dropped messages are:
-# 1. Stored in CCR (so LLM can retrieve if needed)
-# 2. Recorded to TOIN (so it learns which patterns matter)
-# 3. Marked with CCR reference in the inserted message
-```
-
-The marker inserted when messages are dropped includes the CCR reference:
-```
-[Earlier context compressed: 14 message(s) dropped by importance scoring.
-Full content available via ccr_retrieve tool with reference 'abc123def456'.]
-```
-
-### Scoring Weights
-
-The `ScoringWeights` class controls how messages are scored:
-
-| Weight | Default | Description |
-|--------|---------|-------------|
-| `recency` | 0.20 | Exponential decay from conversation end |
-| `semantic_similarity` | 0.20 | Embedding cosine similarity to recent context |
-| `toin_importance` | 0.25 | TOIN retrieval_rate (high retrieval = important) |
-| `error_indicator` | 0.15 | TOIN field_semantics error detection |
-| `forward_reference` | 0.15 | Count of later messages referencing this one |
-| `token_density` | 0.05 | Unique tokens / total tokens |
-
-Weights are automatically normalized to sum to 1.0:
-
-```python
-weights = ScoringWeights(recency=1.0, toin_importance=1.0)
-normalized = weights.normalized()
-# recency=0.5, toin_importance=0.5, others=0.0
-```
+> The earlier `RollingWindowConfig`, `IntelligentContextConfig`, and
+> `ScoringWeights` configuration classes (and the position-/score-based
+> context managers they configured) have been removed and are no longer part
+> of Headroom.
 
 ## Environment Variables
 
@@ -314,6 +241,23 @@ Some settings can be configured via environment variables:
 | `HEADROOM_EMBEDDER_RUNTIME` | Set to `pytorch_mps` to run the memory embedder via the torch sentence-transformers backend on the Apple GPU (MPS). Only engages when Apple MPS is actually available; otherwise it logs a warning and uses the existing default embedder selection path. `pytorch_mps` is the only accepted value. Requires the `[pytorch-mps]` extra. See [Memory](memory.md#embedding-runtime--gpu-offload-apple-silicon). | default embedder selection |
 | `HEADROOM_BETA_HEADER_STICKY` | Controls per-session `anthropic-beta` / `OpenAI-Beta` re-echo. `enabled` (default): the proxy unions beta tokens across turns within a session — if the client sends a token in turn N and omits it in turn N+1, the proxy re-injects it to preserve prefix-cache stability. `disabled`: the client's value is forwarded verbatim with no accumulation. Any other value raises at request time. See [Session Beta Header Tracking](#session-beta-header-tracking). | `enabled` |
 | `HEADROOM_BETA_TRACKER_MAX_SESSIONS` | LRU capacity of the in-memory session beta tracker. Once full, the oldest session entry is evicted. | `1000` |
+
+## Settings GUI
+
+A web-based settings interface is available at `http://127.0.0.1:<port>/dashboard/settings` for configuring every safe `HEADROOM_*` proxy knob without hand-exporting environment variables, plus an **Endpoints** group for custom Anthropic/OpenAI upstream base URLs (`ANTHROPIC_TARGET_API_URL` / `OPENAI_TARGET_API_URL`) and extra headers merged into (and overriding) forwarded requests -- e.g. for a corporate gateway or Azure Foundry deployment that needs a different endpoint plus one extra auth header. Fields are split into a **Settings** tab (commonly-tuned: compression ratio, budget, rate limits, verbosity) and an **Advanced** tab (everything else, including Endpoints). Third-party credentials such as `OPENAI_API_KEY`/`AWS_*` are never exposed here; the two extra-headers fields are the only secret-typed fields in the panel and render masked once set, with a "Clear stored value" action to remove them -- resaving the page without touching a masked field never overwrites the real stored value.
+
+- **Persistence**: Settings are saved to `~/.headroom/settings.json` (merged with existing values, not replaced) and loaded into the process environment at startup.
+- **Precedence** (highest to lowest):
+  - Explicit shell export (`export HEADROOM_FOO=bar`)
+  - Settings from `~/.headroom/settings.json`
+  - Code default
+- **Activation**: Click "Save" to persist without restarting, or "Apply & Restart" to persist and take effect immediately. Apply & Restart behavior depends on how the proxy is running:
+  - **Service** (supervised launchd/systemd install): self-restarts in one click.
+  - **Docker**: cannot self-restart from inside the container; the GUI surfaces the host-side `headroom install restart --profile <p>` command to run instead.
+  - **Task** (Windows Task Scheduler / cron-managed install): `headroom install` does not support lifecycle operations for task deployments; the GUI shows an instruction to restart via the OS task scheduler or by stopping the process so it relaunches on its next trigger.
+  - **Foreground** (plain `headroom proxy`): shows a manual-restart instruction.
+- **Provenance / locking**: a field currently shadowed by an explicit environment variable export is rendered read-only with a tooltip, since editing it here would have no effect until the env var is unset. Manifest-baked settings (`HEADROOM_PORT`, `HEADROOM_HOST`) are similarly locked on supervised (Docker/Service) installs — managed by the install manifest, not the settings interface.
+- **CSRF protection**: `/settings` and `/settings/apply` reject requests whose `Origin` header (when present) doesn't resolve to a loopback host, in addition to the existing loopback-only + Host-header DNS-rebinding guard shared by all admin endpoints.
 
 ## Session Beta Header Tracking
 
@@ -358,13 +302,55 @@ Configure context limits and pricing for new or custom models. Useful when:
 
 ### Configuration Methods
 
-Settings are resolved in this order (later overrides earlier):
-1. Built-in defaults
-2. `${HEADROOM_CONFIG_DIR}/models.json` (defaults to
+Headroom reads public model metadata from the **installed LiteLLM model database**
+(`litellm.model_cost`). That data ships with the LiteLLM package rather than being
+fetched at runtime, so it is as current as your installed LiteLLM version and
+refreshes when you upgrade it. No network call is made.
+
+Explicit configuration comes from three places, later overriding earlier:
+
+1. `${HEADROOM_CONFIG_DIR}/models.json` (defaults to
    `~/.headroom/config/models.json`); falls back to the legacy location
    `~/.headroom/models.json` when the canonical file is absent
-3. `HEADROOM_MODEL_LIMITS` environment variable
-4. SDK constructor arguments
+2. `HEADROOM_MODEL_LIMITS` environment variable
+3. SDK constructor arguments
+
+Limits and prices then resolve with **different** precedence. Both are
+first-match-wins:
+
+**Context limits**
+
+1. **Explicit configuration and the built-in table, checked together** — they are
+   merged into one mapping, so an exact match in either returns immediately,
+   followed by partial/prefix matches.
+2. **LiteLLM** (`max_input_tokens`) — reached only for models step 1 didn't match.
+3. **Pattern inference**, then a generic default.
+
+**Pricing**
+
+1. **Explicit configuration** — a configured value is a decision, so it beats
+   everything below.
+2. **LiteLLM.**
+3. **Built-in table**, then pattern inference, then a generic default.
+
+The asymmetry is deliberate. For limits a built-in entry outranks LiteLLM because
+LiteLLM reports a model's maximum *capability* while Headroom needs its *effective
+default*: LiteLLM gives `claude-sonnet-4-20250514` 1,000,000, but that window is
+an opt-in beta, so the built-in 200,000 is the safe assumption for a client that
+has not enabled it. Pricing has no capability-vs-default split, so there LiteLLM
+wins outright.
+
+Limits are an **input** budget (`max_input_tokens`), not the total window: `gpt-5`
+resolves to 272K input, not the 400K total (272K in + 128K out).
+
+LiteLLM also resolves gateway-routed names (`azure/...`, `bedrock/...`,
+`vertex_ai/...`, `groq/...`) that the built-in tables never covered, and the
+built-in tables additionally cover installs where LiteLLM is unavailable (the
+dependency is gated `python_version < '3.14'`).
+
+Configure only models Headroom can't already look up — fine-tunes, private
+deployments, gateway aliases. Pinning a public model's *price* here means
+maintaining a number yourself that would otherwise stay current.
 
 ### Config File Format
 
@@ -387,11 +373,11 @@ Create `~/.headroom/models.json`:
   },
   "openai": {
     "context_limits": {
-      "gpt-5": 256000,
-      "ft:gpt-4o:my-org": 128000
+      "ft:gpt-4o:my-org": 128000,
+      "my-private-deployment": 200000
     },
     "pricing": {
-      "gpt-5": [5.00, 15.00]
+      "my-private-deployment": [5.00, 15.00]
     }
   }
 }
@@ -507,8 +493,8 @@ The TypeScript SDK is configured via environment variables or constructor option
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `HEADROOM_BASE_URL` | Base URL of the Headroom proxy or cloud API | `http://localhost:8787` |
-| `HEADROOM_API_KEY` | API key for Headroom Cloud authentication | - |
+| `HEADROOM_BASE_URL` | Base URL of the Headroom proxy | `http://localhost:8787` |
+| `HEADROOM_API_KEY` | Optional API key for authenticated Headroom endpoints | - |
 
 ### Usage
 

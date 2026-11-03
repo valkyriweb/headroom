@@ -17,6 +17,8 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 
+from headroom.offline import guard_egress, pin_litellm_cost_map_local
+
 logger = logging.getLogger(__name__)
 
 # Prompt template for LLM judge
@@ -73,6 +75,7 @@ def create_openai_judge(
             "OpenAI package required for LLM judge. Install with: pip install openai"
         ) from e
 
+    guard_egress("OpenAI API for the memory eval LLM judge", "api.openai.com")
     client = OpenAI(api_key=api_key) if api_key else OpenAI()
 
     def judge(question: str, ground_truth: str, prediction: str) -> tuple[float, str]:
@@ -124,6 +127,7 @@ def create_anthropic_judge(
             "Anthropic package required for LLM judge. Install with: pip install anthropic"
         ) from e
 
+    guard_egress("Anthropic API for the memory eval LLM judge", "api.anthropic.com")
     client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
 
     def judge(question: str, ground_truth: str, prediction: str) -> tuple[float, str]:
@@ -165,6 +169,7 @@ def create_litellm_judge(
         score, reasoning = judge_fn(question, ground_truth, prediction)
     """
     try:
+        pin_litellm_cost_map_local()
         import litellm
     except ImportError as e:
         raise ImportError(
@@ -201,7 +206,8 @@ def _parse_judge_response(text: str) -> tuple[float, str]:
         Tuple of (score, reasoning).
     """
     reasoning = ""
-    score = 3.0  # Default to middle score if parsing fails
+    score: float | None = None
+    parsed = False
 
     lines = text.strip().split("\n")
 
@@ -222,40 +228,25 @@ def _parse_judge_response(text: str) -> tuple[float, str]:
                     score = float(match.group(1))
                     # Clamp to valid range
                     score = max(1.0, min(5.0, score))
+                    parsed = True
             except ValueError:
                 logger.warning(f"Could not parse score from: {score_text}")
+
+    if not parsed:
+        # Default to a failing score so unparseable judge output doesn't
+        # silently pass downstream `judge_score >= 3.0` checks.
+        logger.warning(
+            f"Could not parse a score from judge response, defaulting to 0.0 (fail): {text!r}"
+        )
+        score = 0.0
+
+    assert score is not None
 
     # If no explicit reasoning found, use the whole text
     if not reasoning:
         reasoning = text.strip()
 
     return score, reasoning
-
-
-def create_batch_judge(
-    judge_fn: Callable[[str, str, str], tuple[float, str]],
-    max_concurrent: int = 5,
-) -> Callable[[list[tuple[str, str, str]]], list[tuple[float, str]]]:
-    """Create a batch judge function for parallel evaluation.
-
-    Args:
-        judge_fn: Single-item judge function.
-        max_concurrent: Maximum concurrent API calls.
-
-    Returns:
-        A function that takes a list of (question, ground_truth, prediction)
-        and returns a list of (score, reasoning).
-    """
-    from concurrent.futures import ThreadPoolExecutor
-
-    def batch_judge(
-        items: list[tuple[str, str, str]],
-    ) -> list[tuple[float, str]]:
-        with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
-            futures = [executor.submit(judge_fn, q, gt, pred) for q, gt, pred in items]
-            return [f.result() for f in futures]
-
-    return batch_judge
 
 
 # Convenience function for simple scoring without LLM

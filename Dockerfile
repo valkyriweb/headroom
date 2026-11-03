@@ -7,6 +7,8 @@ ARG PYTHON_SITE_PACKAGES=/usr/local/lib/python${PYTHON_VERSION}/site-packages
 FROM python:${PYTHON_VERSION}-slim AS builder
 
 ARG UV_VERSION
+ARG PYTHON_SITE_PACKAGES
+ARG HEADROOM_BUILD_VERSION=""
 
 # build-essential / g++ for any C extension wheels uv may need to build
 # from source. curl + ca-certificates are required by the rustup
@@ -45,11 +47,100 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
 COPY headroom/ headroom/
 
-ARG HEADROOM_EXTRAS=proxy,code
+# The standalone Dockerfile must support every backend advertised by
+# `headroom proxy --backend`, including Bedrock temporary/SSO credentials.
+# Those credentials require botocore (GH #1551), supplied by [bedrock].
+# [redis] backs the replica-shared stores: without it HEADROOM_COMPRESS_SESSION_STORE
+# stops startup and HEADROOM_CCR_BACKEND=redis falls back to a per-process store.
+ARG HEADROOM_EXTRAS=proxy,code,bedrock,redis
+# `uv pip install` ignores [tool.uv] override-dependencies (uv.lock only), so
+# pass them explicitly: the image gets the security overrides the lock has
+# (pillow 13 over fastembed's <13 cap).
 RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
-    uv pip install --system ".[${HEADROOM_EXTRAS}]"
+    python -c "exec('try: import tomllib\\nexcept ImportError: from pip._vendor import tomli as tomllib'); print('\\n'.join(tomllib.load(open('pyproject.toml', 'rb'))['tool']['uv']['override-dependencies']))" > /tmp/overrides.txt && \
+    uv pip install --system --overrides /tmp/overrides.txt ".[${HEADROOM_EXTRAS}]"
+
+RUN --mount=type=bind,source=.,target=/context,readonly \
+    HEADROOM_BUILD_VERSION="${HEADROOM_BUILD_VERSION}" PYTHON_SITE_PACKAGES="${PYTHON_SITE_PACKAGES}" python - <<'PY'
+import hashlib
+import os
+from pathlib import Path
+
+
+def git_revision(context: Path) -> str | None:
+    git_dir = context / ".git"
+    head_path = git_dir / "HEAD"
+    if not head_path.exists():
+        return None
+    head = head_path.read_text(encoding="utf-8").strip()
+    if head.startswith("ref: "):
+        ref_name = head.removeprefix("ref: ").strip()
+        ref_path = git_dir / ref_name
+        if ref_path.exists():
+            head = ref_path.read_text(encoding="utf-8").strip()
+        else:
+            packed_refs = git_dir / "packed-refs"
+            if not packed_refs.exists():
+                return None
+            for line in packed_refs.read_text(encoding="utf-8").splitlines():
+                if line.startswith("#") or not line.strip():
+                    continue
+                sha, _, name = line.partition(" ")
+                if name.strip() == ref_name:
+                    head = sha
+                    break
+            else:
+                return None
+    return head[:12] if len(head) >= 7 and all(c in "0123456789abcdef" for c in head.lower()) else None
+
+
+def source_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    inputs = (
+        "pyproject.toml",
+        "uv.lock",
+        "README.md",
+        "Cargo.toml",
+        "Cargo.lock",
+        "rust-toolchain.toml",
+        "crates",
+        "headroom",
+    )
+    for name in inputs:
+        path = root / name
+        if not path.exists():
+            continue
+        files = [path] if path.is_file() else sorted(p for p in path.rglob("*") if p.is_file())
+        for file in files:
+            digest.update(file.relative_to(root).as_posix().encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(file.read_bytes())
+            digest.update(b"\0")
+    return digest.hexdigest()[:12]
+
+
+build_version = os.environ["HEADROOM_BUILD_VERSION"].strip()
+if not build_version:
+    print("no Headroom build version override provided; using installed package metadata")
+    raise SystemExit(0)
+if build_version == "source-build":
+    revision = git_revision(Path("/context"))
+    build_version = (
+        f"source-build+g{revision}"
+        if revision
+        else f"source-build+sha256.{source_digest(Path('/build'))}"
+    )
+
+package_dir = Path(os.environ["PYTHON_SITE_PACKAGES"]) / "headroom"
+(package_dir / "_build_info.py").write_text(
+    "BUILD_VERSION = " + repr(build_version) + "\n",
+    encoding="utf-8",
+)
+print("baked Headroom build version: " + build_version)
+PY
 
 # Build-stage smoke check: verify the extension loads end-to-end inside
 # the build image before we copy site-packages into the runtime image.
@@ -75,6 +166,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM python:${PYTHON_VERSION}-slim AS runtime-slim-base
 
 ARG RUNTIME_USER=nonroot
+ARG RUNTIME_HOME=/home/nonroot
 ARG PYTHON_SITE_PACKAGES
 
 RUN apt-get update && \
@@ -97,19 +189,30 @@ RUN mkdir -p /home/nonroot /data && \
     fi
 
 USER ${RUNTIME_USER}
-WORKDIR /home/nonroot
+WORKDIR ${RUNTIME_HOME}
 
-ENV HEADROOM_HOST=0.0.0.0 \
+ENV HEADROOM_HOST=127.0.0.1 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
+# Declare ~/.headroom as a volume so Docker (and ACA) can attach persistent
+# storage here.  Bare `docker run` gets an anonymous volume as a fallback so
+# state is never silently written to the ephemeral container layer.
+# RUNTIME_HOME defaults to /home/nonroot (the published image default); pass
+# --build-arg RUNTIME_HOME=/root when building with RUNTIME_USER=root.
+VOLUME ${RUNTIME_HOME}/.headroom
+
 EXPOSE 8787
 
+# Shell form so ${HEADROOM_PORT} expands at probe time: `headroom deploy
+# --port N` sets it in the container env, and an exec-form CMD would keep
+# probing 8787 and report a working deployment as unhealthy (issue #2432).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD ["curl", "--fail", "--silent", "http://127.0.0.1:8787/readyz"]
+    CMD curl --fail --silent "http://127.0.0.1:${HEADROOM_PORT:-8787}/readyz"
 
 ENTRYPOINT ["headroom", "proxy"]
-CMD ["--host", "0.0.0.0", "--port", "8787"]
+# Keep host and port defaults in the CLI so HEADROOM_HOST and HEADROOM_PORT
+# remain authoritative for the published image.
 
 FROM ${DISTROLESS_IMAGE} AS runtime-slim
 
@@ -123,18 +226,23 @@ COPY --from=builder /usr/local/bin/headroom-proxy /usr/local/bin/headroom-proxy
 USER ${RUNTIME_USER}
 WORKDIR /app
 
-ENV HEADROOM_HOST=0.0.0.0 \
+ENV HEADROOM_HOST=127.0.0.1 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=${PYTHON_SITE_PACKAGES}
 
 EXPOSE 8787
 
+# This stage is distroless, so there is no shell to expand ${HEADROOM_PORT}.
+# Resolve the port inside Python instead, keeping exec form (issue #2432).
+# `or` rather than a get() default so an empty HEADROOM_PORT falls back the
+# same way `${HEADROOM_PORT:-8787}` does in the shell-form stage above.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD ["python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/readyz', timeout=5)"]
+    CMD ["python3", "-c", "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + (os.environ.get('HEADROOM_PORT') or '8787') + '/readyz', timeout=5)"]
 
 ENTRYPOINT ["python3", "-m", "headroom.cli", "proxy"]
-CMD ["--host", "0.0.0.0", "--port", "8787"]
+# Keep host and port defaults in the CLI so HEADROOM_HOST and HEADROOM_PORT
+# remain authoritative for the published image.
 
 # Default published image remains python-slim runtime
 FROM runtime-slim-base AS runtime

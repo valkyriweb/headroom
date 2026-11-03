@@ -8,8 +8,11 @@ Offline failure learning for coding agents. Analyzes past conversations, finds w
 # See recommendations for current project (dry-run, no changes)
 headroom learn
 
-# Write recommendations to CLAUDE.md and MEMORY.md
+# Write recommendations to CLAUDE.local.md (gitignored, personal default)
 headroom learn --apply
+
+# Write to the shared team file instead
+headroom learn --apply --target CLAUDE.md
 
 # Analyze a specific project
 headroom learn --project ~/my-project --apply
@@ -99,10 +102,10 @@ Commands repeatedly rejected — model should suggest them to the user instead.
 
 | Pattern | Claude Code | Codex | Gemini CLI |
 |---------|-------------|-------|-----------|
-| Environment, paths, commands | **CLAUDE.md** | **AGENTS.md** | **GEMINI.md** |
+| Environment, paths, commands | **CLAUDE.local.md** (default) or `CLAUDE.md` (with `--target CLAUDE.md`) | **AGENTS.md** | **GEMINI.md** |
 | Retry patterns, permissions | **MEMORY.md** | **instructions.md** | **GEMINI.md** |
 
-Output files are agent-native: Claude Code uses CLAUDE.md/MEMORY.md, Codex uses AGENTS.md, Gemini uses GEMINI.md. The same learnings, written to the format each agent reads.
+Output files are agent-native: Claude Code writes to `CLAUDE.local.md` by default (gitignored, personal); pass `--target CLAUDE.md` for the shared team file. Codex uses `AGENTS.md`, Gemini uses `GEMINI.md`. The same learnings, written to the format each agent reads.
 
 ## Marker-Based Updates
 
@@ -150,12 +153,43 @@ headroom learn [OPTIONS]
 
 Options:
   --project PATH               Project directory (default: current directory)
-  --all                        Analyze all discovered projects
+  --all                        Analyze all discovered projects (mutually exclusive with --project)
   --apply                      Write recommendations (default: dry-run)
-  --agent [auto|claude|codex|gemini]
+  --target TEXT                Context file to write (default: CLAUDE.local.md for Claude Code)
+  --main-only                  Write only to the main context file, skip MEMORY.md
+  --agent [auto|claude|codex|gemini|grok|opencode]
                                Which agent to analyze (default: auto-detect)
   --model TEXT                 LLM for analysis (default: auto from API keys or CLI)
+  --workers / -j INTEGER       Parallel analysis workers (min 1, default: auto)
+  --verbosity                  Analyze verbosity level instead of failure patterns
+  --llm-judge                  Use an LLM to score verbosity quality (requires --verbosity)
 ```
+
+### Verbosity learning (`--verbosity`)
+
+`headroom learn --verbosity` analyzes past sessions to infer the ideal output verbosity level for your project and writes a `verbosity.json` profile.
+
+**Important**: the output shaper is **off by default** (`HEADROOM_OUTPUT_SHAPER=1`
+turns it on; it is available on every rollout channel). Running `--verbosity --apply` will either:
+- Hot-enable the output shaper on an eligible running proxy (`POST /admin/runtime-env`), OR
+- Print instructions to set `HEADROOM_OUTPUT_SHAPER=1` before `headroom wrap ...`
+
+A proxy in cache mode (the default) does not read `verbosity.json`: a level that
+changes mid-conversation would bust the prompt cache, so it steers at its startup
+level. On a cache-mode proxy `--apply` therefore also pins
+`HEADROOM_VERBOSITY_LEVEL` to the learned level, and records the pin (port,
+proxy pid, level) in `verbosity_pin.json`. A `HEADROOM_VERBOSITY_LEVEL` that is
+already set is left alone, and `--apply` says so. The one exception is a pin that
+record proves an earlier `--apply` set: the same proxy process still holding the
+same raw value. That pin is replaced. A changed raw pin remains operator-owned
+even if it clamps to the same effective level as the previous CLI pin.
+
+To keep the shaper on across proxy restarts, export `HEADROOM_OUTPUT_SHAPER=1` before starting the proxy, plus `HEADROOM_VERBOSITY_LEVEL=<level>` in cache mode.
+
+**Flag interactions**:
+- `--all` and `--project` are mutually exclusive
+- `--llm-judge` requires `--verbosity`
+- `--verbosity --all --apply` is rejected (verbosity persists a single global level)
 
 ### Supported Agents
 
@@ -164,6 +198,8 @@ Options:
 | **Claude Code** | Reads `~/.claude/projects/*.jsonl` | ClaudeCodeWriter | CLAUDE.md, MEMORY.md |
 | **OpenAI Codex** | Reads `~/.codex/sessions/*.json` | CodexWriter | AGENTS.md, instructions.md |
 | **Gemini CLI** | Reads `~/.gemini/tmp/*/chats/session-*.json` | GeminiWriter | GEMINI.md |
+| **Grok CLI** | Reads `~/.grok/sessions/<workspace>/<session-id>/updates.jsonl` | GrokWriter | GROK.md |
+| **OpenCode** | Reads the OpenCode SQLite DB at `~/.local/share/opencode/opencode.db` (or `opencode-local.db`; override with `HEADROOM_OPENCODE_DB`) | CodexWriter (shared) | AGENTS.md, instructions.md |
 
 ## LLM Backend Selection
 
@@ -192,7 +228,17 @@ export HEADROOM_LEARN_CLI=codex
 headroom learn
 ```
 
-Valid values for `HEADROOM_LEARN_CLI`: `claude`, `gemini`, `codex`.
+Valid values for `HEADROOM_LEARN_CLI`: `claude`, `gemini`, `codex`, `agy`.
+
+`agy` (Antigravity CLI) is never auto-detected. It has no mode that starts a session without tools, so instructions embedded in analyzed session text could make it write files or run shell commands with your permissions. To use it anyway, opt in explicitly:
+
+```bash
+export HEADROOM_LEARN_CLI=agy
+export HEADROOM_LEARN_ALLOW_UNSAFE_AGY=1
+headroom learn
+```
+
+Without `HEADROOM_LEARN_ALLOW_UNSAFE_AGY=1`, selecting `agy` (via `HEADROOM_LEARN_CLI` or `--model agy-cli`) fails before any analysis runs.
 
 ## Real-World Results
 

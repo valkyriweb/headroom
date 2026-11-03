@@ -17,7 +17,6 @@ CCR eliminates this tradeoff.
 |-----------|-------------------|-----------------|
 | **SmartCrusher** | JSON arrays (tool outputs) | Stores original array, marker includes hash |
 | **ContentRouter** | Code, logs, search results, text | Stores original content by strategy |
-| **IntelligentContextManager** | Messages (conversation turns) | Stores dropped messages, marker includes hash |
 
 ## How CCR Works
 
@@ -55,8 +54,7 @@ Headroom injects a `headroom_retrieve` tool into the LLM's available tools:
   "name": "headroom_retrieve",
   "description": "Retrieve original uncompressed data from Headroom cache",
   "parameters": {
-    "hash": "The hash key from the compression marker",
-    "query": "Optional: search within the cached data"
+    "hash": "The hash key from the compression marker"
   }
 }
 ```
@@ -91,36 +89,31 @@ Turn 5: User asks "What about the auth middleware?"
         → LLM sees full file list, finds auth_middleware.py
 ```
 
-## Message-Level CCR (IntelligentContext)
+## CCR Stores Content Blocks, Not Dropped Messages
 
-IntelligentContextManager is a **message-level compressor**. When it drops low-importance messages to fit the context budget, those messages are stored in CCR:
+Headroom never drops whole messages from conversation history. CCR is purely about compressed **content blocks** — the newest tool outputs, tool results, and user content that the live-zone pipeline compresses. The original block is stored in the cache and is retrievable on demand:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  LONG CONVERSATION (100 messages, 50K tokens)                    │
-│  └─ IntelligentContext scores messages by importance            │
-│  └─ Drops 60 low-scoring messages                               │
-│  └─ Dropped messages cached with hash=def456                    │
-│  └─ Marker inserted: "60 messages dropped, retrieve: def456"    │
+│  LATEST TOOL RESULT (500 files, 12K tokens)                      │
+│  └─ ContentRouter / SmartCrusher compresses the block           │
+│  └─ Original cached with hash=def456                            │
+│  └─ Marker inserted: "500 items compressed, retrieve: def456"   │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  LLM PROCESSING                                                  │
-│  Option A: LLM solves task with remaining messages → Done       │
-│  Option B: LLM needs earlier context                            │
+│  Option A: LLM solves task with the compressed block → Done     │
+│  Option B: LLM needs the full content                           │
 │            → Calls headroom_retrieve(hash=def456)               │
-│            → Full conversation restored                          │
+│            → Full original block restored                        │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**The marker includes the CCR reference:**
-```
-[Earlier context compressed: 60 message(s) dropped by importance scoring.
-Full content available via ccr_retrieve tool with reference 'def456'.]
-```
+The older conversation turns, system prompt, and tool definitions — the provider cache hot zone — are never mutated, so prompt caching keeps working. Compression happens only on the live zone (the newest content blocks) and is fully reversible via CCR.
 
-**TOIN integration:** When users retrieve dropped messages, TOIN learns to score those message patterns higher next time, improving future drop decisions across all users.
+**TOIN integration:** When users retrieve compressed content, TOIN learns to treat those patterns as higher value next time, improving future compression decisions across all users.
 
 ## Features
 
@@ -128,7 +121,7 @@ Full content available via ccr_retrieve tool with reference 'def456'.]
 |---------|-------------|
 | **Automatic Response Handling** | When LLM calls `headroom_retrieve`, the proxy handles it automatically |
 | **Multi-Turn Context Tracking** | Tracks compressed content across turns, proactively expands when relevant |
-| **BM25 Search** | LLM can search within compressed data: `headroom_retrieve(hash, query="errors")` |
+| **Hash-Keyed Retrieval** | `headroom_retrieve(hash)` always returns the full original content |
 | **Feedback Learning** | Learns from retrieval patterns to improve future compression |
 
 ## Configuration
@@ -137,11 +130,11 @@ Full content available via ccr_retrieve tool with reference 'def456'.]
 # Proxy with CCR enabled (default)
 headroom proxy --port 8787
 
-# Disable CCR response handling
-headroom proxy --no-ccr-responses
+# Disable CCR entirely: no retrieval markers, no headroom_retrieve tool
+headroom proxy --no-ccr
 
-# Disable proactive expansion
-headroom proxy --no-ccr-expansion
+# Disable proactive expansion of previously-compressed content
+headroom proxy --no-ccr-proactive-expansion
 ```
 
 ## Why This Matters
@@ -156,30 +149,27 @@ CCR gives you the savings of aggressive compression with zero risk — the LLM c
 
 ## Demo
 
-Run the CCR demonstration to see it in action:
+`examples/ccr_demo.py` no longer exists in this repo. The closest working example is `examples/test_ccr.py`, which compresses a tool result and checks that key content survives compression:
 
 ```bash
-python examples/ccr_demo.py
+python examples/test_ccr.py
 ```
 
-Output:
+Verified output (`.venv/bin/python examples/test_ccr.py`):
 ```
-1. COMPRESSION STORE
-   Original: 100 items (7,059 chars)
-   Compressed: 8 items (633 chars)
-   Reduction: 91.0%
+Tokens: 2904 -> 2703 (201 saved)
+Transforms: ['router:protected:user_message', 'router:mixed:0.97']
 
-3. RESPONSE HANDLER
-   Detected CCR tool call: True
-   Retrieved 100 items automatically
+No CCR markers
 
-4. CONTEXT TRACKER
-   Turn 5: User asks "show authentication middleware"
-   Tracker found 1 relevant context
-   → relevance=0.73
-   Proactively expanded: 100 items
+  reward tampering: FOUND
+  sycophancy: FOUND
+  ...
+6/6 key concepts preserved in compressed output
 ```
+
+Note this run shows "No CCR markers" — `examples/test_ccr.py` calls the SDK `compress()` function directly, and this particular payload doesn't cross the size threshold that triggers a CCR marker. The full compress-cache-retrieve tool-call loop (`headroom_retrieve`, proactive expansion) only runs inside `headroom proxy`, not the standalone SDK call.
 
 ## Architecture
 
-For implementation details, see [ARCHITECTURE.md](ARCHITECTURE.md#ccr-compress-cache-retrieve).
+For implementation details, see [ARCHITECTURE.md](ARCHITECTURE.md#ccr-architecture-compress-cache-retrieve).

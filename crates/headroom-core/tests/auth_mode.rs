@@ -65,8 +65,16 @@ fn chatgpt_account_jwt_claim_classified_subscription() {
 
 #[test]
 fn oauth_sk_ant_oat_classified_oauth() {
-    // Claude Pro / Max OAuth: `Bearer sk-ant-oat-...`.
+    // Legacy/synthetic Claude Pro / Max OAuth fixture.
     let h = headers(&[("authorization", "Bearer sk-ant-oat-01-abc123def456")]);
+    assert_eq!(classify(&h), AuthMode::OAuth);
+}
+
+#[test]
+fn oauth_real_sk_ant_oat01_classified_oauth() {
+    // Real Anthropic OAuth access tokens are `sk-ant-oat01-...`:
+    // a version number, no dash after `oat`.
+    let h = headers(&[("authorization", "Bearer sk-ant-oat01-abc123def456")]);
     assert_eq!(classify(&h), AuthMode::OAuth);
 }
 

@@ -27,8 +27,10 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import logging
 import uuid as _uuid
+import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -40,6 +42,34 @@ from ..utils import compute_short_hash, deep_copy_messages
 from .base import Transform
 
 logger = logging.getLogger(__name__)
+
+
+def _stable_prefix_observability_scope(
+    messages: list[dict[str, Any]],
+    frozen_message_count: int,
+) -> tuple[str, int]:
+    if frozen_message_count <= 0:
+        system_text = "\n---\n".join(
+            (m.get("content") or "")
+            for m in messages
+            if m.get("role") == "system" and isinstance(m.get("content"), str)
+        )
+        return system_text, len(system_text.encode("utf-8"))
+
+    scope = json.dumps(
+        {
+            "frozen_prefix": messages[:frozen_message_count],
+            "trailing_system": [
+                m
+                for i, m in enumerate(messages)
+                if i >= frozen_message_count and m.get("role") == "system"
+            ],
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return scope, len(scope.encode("utf-8"))
 
 
 # Length profile for hex hash detection. Kept as named constants — no magic
@@ -309,16 +339,12 @@ class CacheAligner(Transform):
             warnings.append(msg_text)
             logger.warning(msg_text)
 
-        # Compute a stable hash of all system messages for observability.
-        # This is just a hash of the (unchanged) bytes — no extraction.
-        system_text = "\n---\n".join(
-            (m.get("content") or "")
-            for m in result_messages
-            if m.get("role") == "system" and isinstance(m.get("content"), str)
+        scope_text, prefix_bytes = _stable_prefix_observability_scope(
+            result_messages,
+            frozen_message_count,
         )
-        stable_hash = compute_short_hash(system_text)
-        prefix_bytes = len(system_text.encode("utf-8"))
-        prefix_tokens_est = tokenizer.count_text(system_text)
+        stable_hash = compute_short_hash(scope_text)
+        prefix_tokens_est = tokenizer.count_text(scope_text)
         prefix_changed = (
             self._previous_prefix_hash is not None and self._previous_prefix_hash != stable_hash
         )
@@ -370,9 +396,21 @@ def align_for_cache(
 ) -> tuple[list[dict[str, Any]], str]:
     """Convenience wrapper that runs detection and returns the unchanged messages.
 
-    Kept as a stable public API; the second tuple element is the stable
-    prefix hash for callers that want to track cache prefix drift.
+    The second tuple element is the stable prefix hash for callers that want
+    to track cache prefix drift.
+
+    .. deprecated::
+        Unused inside Headroom; will be removed in a future release. Use
+        ``CacheAligner(config).apply(messages, tokenizer)`` and read the
+        ``stable_prefix_hash:`` marker from ``markers_inserted``.
     """
+    warnings.warn(
+        "align_for_cache is deprecated and will be removed in a future release; use "
+        "CacheAligner(config).apply(messages, tokenizer) and read the stable_prefix_hash: "
+        "marker from markers_inserted.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     cfg = config or CacheAlignerConfig()
     aligner = CacheAligner(cfg)
     tokenizer = Tokenizer(EstimatingTokenCounter())  # type: ignore[arg-type]

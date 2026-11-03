@@ -173,7 +173,25 @@ class TestHasNonTextParts:
 
     @pytest.mark.parametrize(
         "non_text_key",
-        ["inlineData", "fileData", "functionCall", "functionResponse"],
+        [
+            "inlineData",
+            "fileData",
+            "functionCall",
+            "functionResponse",
+            # Gemini code-execution parts, echoed back in contents[] on later
+            # turns; previously not detected, so they were dropped on round-trip.
+            "executableCode",
+            "codeExecutionResult",
+            # The REST API also accepts the proto field names, which Google's
+            # own curl examples use; these were dropped on round-trip too.
+            "inline_data",
+            "file_data",
+            "function_call",
+            "function_response",
+            "executable_code",
+            "code_execution_result",
+            "thought_signature",
+        ],
     )
     def test_each_non_text_key_detected(self, proxy, non_text_key):
         """Each non-text part type is correctly detected."""
@@ -184,6 +202,36 @@ class TestHasNonTextParts:
         """Content missing 'parts' key returns False (graceful handling)."""
         content = {"role": "user"}
         assert proxy._has_non_text_parts(content) is False
+
+    def test_snake_case_parts_survive_compression_round_trip(self, proxy):
+        """snake_case image and tool parts are restored after compression rewrites text."""
+        contents = [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": "Describe this image"},
+                    {"inline_data": {"mime_type": "image/png", "data": "iVBORw0KGgo="}},
+                ],
+            },
+            {"role": "model", "parts": [{"function_call": {"name": "lookup", "args": {}}}]},
+            {
+                "role": "user",
+                "parts": [{"function_response": {"name": "lookup", "response": {"r": "ok"}}}],
+            },
+            {"role": "user", "parts": [{"text": "thanks " * 100}]},
+        ]
+        messages, preserved = proxy._gemini_contents_to_messages(contents)
+        assert preserved == {0, 1, 2}
+
+        optimized = [dict(m) for m in messages]
+        optimized[-1]["content"] = "thanks (compressed)"
+        optimized_contents, _ = proxy._messages_to_gemini_contents(optimized)
+        rebuilt = proxy._rebuild_gemini_contents(
+            contents, preserved, {i: contents[i] for i in preserved}, optimized_contents
+        )
+
+        assert rebuilt[:3] == contents[:3]
+        assert rebuilt[3] == {"role": "user", "parts": [{"text": "thanks (compressed)"}]}
 
 
 # =============================================================================
@@ -656,6 +704,30 @@ class TestRebuildGeminiContents:
         assert len(result) == 2
         assert result[0]["parts"][0]["text"] == "Hello, world!"
         assert result[1]["parts"][0]["text"] == "Hello! How can I help you today?"
+
+    def test_code_execution_entry_survives(self, proxy):
+        """A text-less code-execution entry (executableCode + codeExecutionResult)
+        between two text turns must survive the round-trip at its position, and
+        not shift a neighboring turn. Before the fix it was not detected as
+        non-text, so it was dropped and the following user turn was misplaced."""
+        code_entry = {
+            "role": "model",
+            "parts": [
+                {"executableCode": {"language": "PYTHON", "code": "x = 1"}},
+                {"codeExecutionResult": {"outcome": "OUTCOME_OK", "output": "1"}},
+            ],
+        }
+        contents = [
+            {"role": "user", "parts": [{"text": "Question 1"}]},
+            code_entry,
+            {"role": "user", "parts": [{"text": "Question 2"}]},
+        ]
+
+        result = self._round_trip(proxy, contents)
+
+        assert len(result) == 3
+        assert result[1] == code_entry  # preserved verbatim, in place
+        assert result[2]["parts"][0]["text"] == "Question 2"
 
     def test_function_call_sequence_preserved(self, proxy):
         """functionCall and functionResponse entries must survive and appear at correct positions."""

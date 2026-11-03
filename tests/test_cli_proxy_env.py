@@ -65,7 +65,7 @@ class TestCLIWrapProxyTimeout:
 
         monkeypatch.delenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, raising=False)
         monkeypatch.setattr(wrap_mod, "_ml_wrap_extras_detected", lambda: False)
-        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
         monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
         monkeypatch.setattr(wrap_mod.time, "sleep", lambda seconds: sleeps.append(seconds))
         monkeypatch.setattr(wrap_mod.subprocess, "Popen", lambda *args, **kwargs: fake_proc)
@@ -82,7 +82,7 @@ class TestCLIWrapProxyTimeout:
 
         monkeypatch.delenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, raising=False)
         monkeypatch.setattr(wrap_mod, "_ml_wrap_extras_detected", lambda: False)
-        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
         monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
         monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
 
@@ -106,13 +106,76 @@ class TestCLIWrapProxyTimeout:
         assert env["GITHUB_COPILOT_API_URL"] == "https://copilot-api.acme.ghe.com"
         assert env["GITHUB_COPILOT_API_TOKEN"] == "copilot-api-token"
 
+    def test_start_proxy_scrubs_inherited_copilot_refresh_seed_env(self, monkeypatch, tmp_path):
+        fake_proc = _FakeProxyProcess()
+        captured: dict[str, object] = {}
+
+        monkeypatch.setenv("GITHUB_COPILOT_API_TOKEN", "stale-parent-token")
+        monkeypatch.setenv("GITHUB_COPILOT_REFRESH_OAUTH_TOKEN", "stale-parent-refresh")
+        monkeypatch.setenv("GITHUB_COPILOT_API_TOKEN_EXPIRES_AT", "123")
+        monkeypatch.delenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, raising=False)
+        monkeypatch.setattr(wrap_mod, "_ml_wrap_extras_detected", lambda: False)
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
+        monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
+
+        def fake_popen(*args, **kwargs):  # noqa: ANN002, ANN003
+            captured["kwargs"] = kwargs
+            return fake_proc
+
+        monkeypatch.setattr(wrap_mod.subprocess, "Popen", fake_popen)
+
+        proc = wrap_mod._start_proxy(
+            8787,
+            agent_type="copilot",
+            copilot_api_token="copilot-api-token",
+            copilot_refresh_oauth_token="gho-refresh",
+            copilot_api_token_expires_at=456.5,
+        )
+
+        assert proc is fake_proc
+        env = captured["kwargs"]["env"]
+        assert env["GITHUB_COPILOT_API_TOKEN"] == "copilot-api-token"
+        assert env["GITHUB_COPILOT_REFRESH_OAUTH_TOKEN"] == "gho-refresh"
+        assert env["GITHUB_COPILOT_API_TOKEN_EXPIRES_AT"] == "456.5"
+
+    def test_start_proxy_redirects_subprocess_stdio_to_standalone_log(self, monkeypatch, tmp_path):
+        fake_proc = _FakeProxyProcess()
+        captured: dict[str, object] = {}
+        logs: list[str] = []
+
+        monkeypatch.delenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, raising=False)
+        monkeypatch.setattr(
+            wrap_mod,
+            "_get_log_path",
+            lambda port=None: tmp_path / (f"proxy-{port}.log" if port is not None else "proxy.log"),
+        )
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
+        monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(wrap_mod, "_ml_wrap_extras_detected", lambda: False)
+        monkeypatch.setattr(wrap_mod.click, "echo", lambda message: logs.append(str(message)))
+
+        def fake_popen(*args, **kwargs):  # noqa: ANN002, ANN003
+            captured["kwargs"] = kwargs
+            return fake_proc
+
+        monkeypatch.setattr(wrap_mod.subprocess, "Popen", fake_popen)
+
+        proc = wrap_mod._start_proxy(8787, agent_type="codex")
+
+        assert proc is fake_proc
+        assert captured["kwargs"]["stdout"] is captured["kwargs"]["stderr"]
+        assert captured["kwargs"]["stdout"].name == str(tmp_path / "proxy-stdio-8787.log")
+        assert captured["kwargs"]["stdout"].name != str(tmp_path / "proxy-8787.log")
+        assert f"  Logs: {tmp_path / 'proxy-8787.log'}" in logs
+
     def test_env_timeout_allows_slow_start_proxy_to_succeed(self, monkeypatch, tmp_path):
         fake_proc = _FakeProxyProcess()
         sleeps = []
         checks = []
 
         monkeypatch.setenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, "4")
-        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
         monkeypatch.setattr(wrap_mod.time, "sleep", lambda seconds: sleeps.append(seconds))
         monkeypatch.setattr(wrap_mod.subprocess, "Popen", lambda *args, **kwargs: fake_proc)
 
@@ -129,11 +192,171 @@ class TestCLIWrapProxyTimeout:
         assert sleeps == [1, 1, 1, 1]
         assert fake_proc.killed is False
 
+    def test_start_proxy_tail_reads_standalone_stdio_log_on_process_exit(
+        self, monkeypatch, tmp_path
+    ):
+        fake_proc = _FakeProxyProcess()
+        fake_proc.returncode = 1
+        fake_proc.poll = lambda: fake_proc.returncode
+
+        monkeypatch.setenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, "2")
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: False)
+        monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
+
+        def popen_writing_stdio(*args, **kwargs):
+            kwargs["stdout"].write("proxy stdio startup output\n")
+            kwargs["stdout"].flush()
+            return fake_proc
+
+        monkeypatch.setattr(wrap_mod.subprocess, "Popen", popen_writing_stdio)
+
+        (tmp_path / "proxy.log").write_text("canonical runtime log output")
+
+        with pytest.raises(RuntimeError) as excinfo:
+            wrap_mod._start_proxy(8787, agent_type="codex")
+
+        message = str(excinfo.value)
+        assert "Proxy exited with code 1" in message
+        assert "proxy stdio startup output" in message
+        assert "canonical runtime log output" not in message
+
+    def test_start_proxy_exit_quotes_this_runs_error_not_summary_or_old_runs(
+        self, monkeypatch, tmp_path
+    ):
+        """The startup error names the cause and the log path.
+
+        The proxy logs its shutdown summary after the error, and the stdio log
+        is appended across runs, so the old ``[-500:]`` tail quoted the summary
+        box (or an earlier run) and never said where the full log was.
+        """
+        fake_proc = _FakeProxyProcess()
+        fake_proc.returncode = 1
+        fake_proc.poll = lambda: fake_proc.returncode
+
+        monkeypatch.setenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, "2")
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: False)
+        monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
+
+        stdio_log = tmp_path / "proxy-stdio-8787.log"
+        stdio_log.write_text("ERROR: stale failure from an earlier run\n")
+        summary = "".join(
+            f"2026-10-09 16:19:23,665 - headroom.proxy - INFO - Summary line {i}: 0\n"
+            for i in range(20)
+        )
+
+        def popen_failing_to_bind(*args, **kwargs):
+            kwargs["stdout"].write(
+                "2026-10-09 16:19:23,659 - headroom.proxy - INFO - Local telemetry: DISABLED\n"
+                "ERROR:    [Errno 48] error while attempting to bind on address "
+                "('127.0.0.1', 8787): address already in use\n" + summary
+            )
+            kwargs["stdout"].flush()
+            return fake_proc
+
+        monkeypatch.setattr(wrap_mod.subprocess, "Popen", popen_failing_to_bind)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            wrap_mod._start_proxy(8787, agent_type="codex")
+
+        message = str(excinfo.value)
+        assert "Proxy exited with code 1" in message
+        assert "[Errno 48] error while attempting to bind" in message
+        assert "stale failure from an earlier run" not in message
+        assert "Local telemetry" not in message
+        assert f"Full log: {stdio_log}" in message
+
+    def test_startup_excerpt_reads_at_most_64_kib_of_this_run(self, monkeypatch, tmp_path):
+        """A runaway stdio log is never read whole: this run's first and last 64 KiB
+        at most, so an error after a long burst of output is still quoted."""
+        stdio_log = tmp_path / "proxy-stdio-8787.log"
+        earlier = "ERROR: an earlier run\n" * 1000
+        noise = "INFO noise line\n" * 16000  # ~256 KiB, no error line
+        late = "ERROR: late startup failure\n"
+        # Bytes, not text: the offset is a byte offset, and write_text would turn
+        # "\n" into "\r\n" on Windows.
+        stdio_log.write_bytes((earlier + noise + late + "INFO shutdown summary\n").encode())
+        read_sizes: list[int] = []
+        real_open = open
+
+        def tracking_open(*args, **kwargs):
+            handle = real_open(*args, **kwargs)
+            real_read = handle.read
+
+            def read(size=-1):
+                data = real_read(size)
+                read_sizes.append(len(data))
+                return data
+
+            handle.read = read
+            return handle
+
+        monkeypatch.setattr(wrap_mod, "open", tracking_open, raising=False)
+
+        excerpt = wrap_mod._proxy_startup_failure_excerpt(stdio_log, len(earlier.encode()))
+
+        assert "earlier run" not in excerpt
+        assert excerpt.startswith("ERROR: late startup failure")
+        assert sum(read_sizes) <= 2 * wrap_mod._PROXY_STARTUP_READ_BYTES
+
+    def test_startup_excerpt_prefers_an_error_in_the_first_64_kib(self, tmp_path):
+        stdio_log = tmp_path / "proxy-stdio-8787.log"
+        noise = "INFO noise line\n" * 16000
+        stdio_log.write_bytes(("ERROR: early failure\n" + noise + "ERROR: later echo\n").encode())
+
+        excerpt = wrap_mod._proxy_startup_failure_excerpt(stdio_log, 0)
+
+        assert excerpt.startswith("ERROR: early failure")
+
+    def test_startup_excerpt_without_error_quotes_the_end_of_the_head(self, tmp_path):
+        """No recognised error line: quote the end of this run's first 64 KiB,
+        even when the tail window is blank."""
+        stdio_log = tmp_path / "proxy-stdio-8787.log"
+        head = "INFO noise line\n" * 3000 + "INFO last startup line\n"  # < 64 KiB
+        stdio_log.write_bytes((head + " \n" * 70000).encode())
+
+        excerpt = wrap_mod._proxy_startup_failure_excerpt(stdio_log, 0)
+
+        assert excerpt.endswith("INFO last startup line")
+
+    def test_startup_excerpt_falls_back_to_a_useful_tail_after_a_blank_head(self, tmp_path):
+        """A whitespace-only head must not hide a useful tail line."""
+        stdio_log = tmp_path / "proxy-stdio-8787.log"
+        stdio_log.write_bytes(b" " * (192 * 1024) + b"initialization could not bind the port\n")
+
+        excerpt = wrap_mod._proxy_startup_failure_excerpt(stdio_log, 0)
+
+        assert excerpt == "initialization could not bind the port"
+
+    def test_startup_excerpt_quotes_click_error_before_a_blank_tail(self, tmp_path):
+        """A Click ``Error:`` line followed by a whitespace-only tail is quoted,
+        not reported as "(no log output)"."""
+        stdio_log = tmp_path / "proxy-stdio-8787.log"
+        stdio_log.write_bytes(("Error: address already in use\n" + " " * (192 * 1024)).encode())
+
+        excerpt = wrap_mod._proxy_startup_failure_excerpt(stdio_log, 0)
+
+        assert excerpt == "Error: address already in use"
+
+    def test_startup_excerpt_starts_at_a_click_style_error_line(self, tmp_path):
+        stdio_log = tmp_path / "proxy-stdio-8787.log"
+        stdio_log.write_bytes(
+            b"INFO starting\nINFO loading config\n"
+            b"Error: Port 8787 on 127.0.0.1 is already in use by another process.\n"
+            b"INFO shutdown summary\n"
+        )
+
+        excerpt = wrap_mod._proxy_startup_failure_excerpt(stdio_log, 0)
+
+        assert excerpt.startswith("Error: Port 8787 on 127.0.0.1 is already in use")
+        assert "INFO starting" not in excerpt
+
     def test_timeout_error_names_configured_timeout_and_env_var(self, monkeypatch, tmp_path):
         fake_proc = _FakeProxyProcess()
 
         monkeypatch.setenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, "2")
-        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
         monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: False)
         monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
         monkeypatch.setattr(wrap_mod.subprocess, "Popen", lambda *args, **kwargs: fake_proc)
@@ -144,6 +367,7 @@ class TestCLIWrapProxyTimeout:
         message = str(excinfo.value)
         assert "within 2 seconds" in message
         assert wrap_mod._WRAP_PROXY_TIMEOUT_ENV in message
+        assert f"Full log: {tmp_path / 'proxy-stdio-8787.log'}" in message
         assert fake_proc.killed is True
 
 
@@ -161,7 +385,10 @@ class TestCLIProxyEnvVars:
             result = runner.invoke(
                 main,
                 ["proxy"],
-                env={"HEADROOM_HOST": "0.0.0.0"},
+                # 0.0.0.0 with no token is refused at startup since the bind
+                # policy landed (tests/test_proxy_bind_policy.py); this test is
+                # about env→config plumbing, so authenticate the bind.
+                env={"HEADROOM_HOST": "0.0.0.0", "HEADROOM_PROXY_TOKEN": "env-test-token"},
                 catch_exceptions=False,
             )
 
@@ -203,6 +430,51 @@ class TestCLIProxyEnvVars:
 
         assert result.exit_code == 0, result.output
         assert captured_config["config"].min_tokens_to_crush == 120
+
+    @pytest.mark.parametrize(
+        ("env", "expected"),
+        [
+            ({"HEADROOM_COMPRESS_USER_MESSAGES": "0"}, False),
+            ({"HEADROOM_COMPRESS_USER_MESSAGES": ""}, True),
+            ({}, True),
+        ],
+    )
+    def test_compress_user_messages_env_off_overrides_profile(self, runner, env, expected):
+        """HEADROOM_COMPRESS_USER_MESSAGES=0 must turn off the coding profile's
+        user-message compression; unset or empty keeps the profile default (on)."""
+        from headroom.agent_savings import proxy_pipeline_kwargs
+
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(main, ["proxy"], env=env, catch_exceptions=False)
+
+        assert result.exit_code == 0, result.output
+        kwargs = proxy_pipeline_kwargs(captured_config["config"])
+        assert kwargs["compress_user_messages"] is expected
+
+    def test_headroom_min_tokens_zero_is_preserved(self, runner):
+        """HEADROOM_MIN_TOKENS=0 is a legitimate value ("crush everything") and
+        must not be discarded by an `or 500` fallback (regression)."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={"HEADROOM_MIN_TOKENS": "0", "HEADROOM_MAX_ITEMS": "0"},
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].min_tokens_to_crush == 0
+        assert captured_config["config"].max_items_after_crush == 0
 
     def test_headroom_budget_from_env(self, runner):
         """HEADROOM_BUDGET env var should be passed to ProxyConfig."""
@@ -268,8 +540,10 @@ class TestCLIProxyEnvVars:
         assert result.exit_code == 0, result.output
         assert captured_config["config"].code_aware_enabled is True
 
-    def test_code_aware_enabled_defaults_false(self, runner):
-        """Without HEADROOM_CODE_AWARE_ENABLED, code-aware stays disabled in the wrapper."""
+    def test_code_aware_enabled_defaults_true(self, runner):
+        """Without HEADROOM_CODE_AWARE_ENABLED, code-aware defaults ON (coding
+        posture; consistent with the argparse server path). It degrades to a no-op
+        when tree-sitter isn't installed, so defaulting it on is safe."""
         captured_config = {}
 
         def mock_run_server(config, **kwargs):
@@ -288,7 +562,7 @@ class TestCLIProxyEnvVars:
             )
 
         assert result.exit_code == 0, result.output
-        assert captured_config["config"].code_aware_enabled is False
+        assert captured_config["config"].code_aware_enabled is True
 
     def test_code_aware_enabled_from_cli_flag(self, runner):
         """--code-aware should enable code-aware compression in the wrapper."""
@@ -512,6 +786,51 @@ class TestCLIProxyEnvVars:
         assert captured_config["config"].openai_api_url == "http://my-vllm:4000"
         assert captured_config["config"].gemini_api_url == "http://my-gemini:5000"
 
+    @pytest.mark.parametrize("timeout", [-1, 0, 1, 10000])
+    def test_request_timeout_cli_flags(self, runner, timeout):
+        """Fast-fail CLI flags should map into ProxyConfig."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy", "--request-timeout-seconds", f"{timeout}"],
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert (
+            captured_config["config"].request_timeout_seconds == timeout
+            if timeout and timeout > 0
+            else 300
+        )
+
+    @pytest.mark.parametrize("timeout", [-1, 0, 1, 10000])
+    def test_request_timeout_from_env(self, runner, timeout):
+        """HEADROOM_REQUEST_TIMEOUT env var should be passed to ProxyConfig."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={"HEADROOM_REQUEST_TIMEOUT": f"{timeout}"},
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert (
+            captured_config["config"].request_timeout_seconds == timeout
+            if timeout and timeout > 0
+            else 300
+        )
+
     def test_retry_and_connect_timeout_cli_flags(self, runner):
         """Fast-fail CLI flags should map into ProxyConfig."""
         captured_config = {}
@@ -566,6 +885,24 @@ class TestCLIProxyEnvVars:
         assert captured["kwargs"]["limit_concurrency"] == 250
         assert captured["kwargs"].get("print_banner") is False
 
+    def test_keepalive_expiry_env_var(self, runner):
+        captured = {}
+
+        def mock_run_server(config, **kwargs):
+            captured["config"] = config
+            captured["kwargs"] = kwargs
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={"HEADROOM_KEEPALIVE_EXPIRY": "45"},
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured["config"].keepalive_expiry == 45.0
+
     def test_production_scaling_cli_flags_override_env_vars(self, runner):
         captured = {}
 
@@ -604,6 +941,20 @@ class TestCLIProxyEnvVars:
         assert captured["kwargs"]["workers"] == 3
         assert captured["kwargs"]["limit_concurrency"] == 125
         assert captured["kwargs"].get("print_banner") is False
+
+
+@pytest.mark.parametrize(("value", "expected"), [("0", False), ("", True), (None, True)])
+def test_proxy_config_from_env_compress_user_messages(monkeypatch, value, expected):
+    """The uvicorn factory and `python -m headroom.proxy.server` read
+    HEADROOM_COMPRESS_USER_MESSAGES the same way `headroom proxy` does."""
+    from headroom.agent_savings import proxy_pipeline_kwargs
+    from headroom.proxy.server import _proxy_config_from_env
+
+    if value is not None:
+        monkeypatch.setenv("HEADROOM_COMPRESS_USER_MESSAGES", value)
+
+    kwargs = proxy_pipeline_kwargs(_proxy_config_from_env())
+    assert kwargs["compress_user_messages"] is expected
 
 
 class TestCLIProxyBackend:
@@ -730,25 +1081,25 @@ class TestCLICompressionOnlyFlags:
         assert cfg.ccr_inject_marker is True
         assert cfg.ccr_proactive_expansion is True
 
-    def test_no_ccr_inject_tool_flag(self, runner):
-        """--no-ccr-inject-tool disables retrieve-tool injection only."""
+    def test_no_ccr_flag(self, runner):
+        """--no-ccr disables BOTH the retrieve-tool injection and the markers."""
         captured_config = {}
 
         def mock_run_server(config, **kwargs):
             captured_config["config"] = config
 
         with patch("headroom.proxy.server.run_server", mock_run_server):
-            result = runner.invoke(main, ["proxy", "--no-ccr-inject-tool"], catch_exceptions=False)
+            result = runner.invoke(main, ["proxy", "--no-ccr"], catch_exceptions=False)
 
         assert result.exit_code == 0, result.output
         cfg = captured_config["config"]
         assert cfg.ccr_inject_tool is False
-        # Untouched flags remain on.
-        assert cfg.ccr_inject_marker is True
+        assert cfg.ccr_inject_marker is False
+        # Unrelated CCR knob stays on.
         assert cfg.ccr_proactive_expansion is True
 
     def test_compression_only_all_flags(self, runner):
-        """All three flags together yield a compression-only config."""
+        """--no-ccr + --no-ccr-proactive-expansion yields a compression-only config."""
         captured_config = {}
 
         def mock_run_server(config, **kwargs):
@@ -759,8 +1110,7 @@ class TestCLICompressionOnlyFlags:
                 main,
                 [
                     "proxy",
-                    "--no-ccr-inject-tool",
-                    "--no-ccr-marker",
+                    "--no-ccr",
                     "--no-ccr-proactive-expansion",
                 ],
                 catch_exceptions=False,
@@ -772,8 +1122,8 @@ class TestCLICompressionOnlyFlags:
         assert cfg.ccr_inject_marker is False
         assert cfg.ccr_proactive_expansion is False
 
-    def test_no_ccr_marker_from_env(self, runner):
-        """HEADROOM_NO_CCR_MARKER env var disables marker injection."""
+    def test_no_ccr_from_env(self, runner):
+        """HEADROOM_NO_CCR env var disables both markers and tool injection."""
         captured_config = {}
 
         def mock_run_server(config, **kwargs):
@@ -783,12 +1133,166 @@ class TestCLICompressionOnlyFlags:
             result = runner.invoke(
                 main,
                 ["proxy"],
-                env={"HEADROOM_NO_CCR_MARKER": "1"},
+                env={"HEADROOM_NO_CCR": "1"},
                 catch_exceptions=False,
             )
 
         assert result.exit_code == 0, result.output
-        assert captured_config["config"].ccr_inject_marker is False
+        cfg = captured_config["config"]
+        assert cfg.ccr_inject_marker is False
+        assert cfg.ccr_inject_tool is False
+
+
+class TestNoCcrMarkerCompressors:
+    """Verify --no-ccr actually suppresses <<ccr:...>> markers
+    from every compressor, not just SmartCrusher (#1022)."""
+
+    def test_content_router_propagates_ccr_inject_marker_false_to_compressors(self):
+        """#1022: ContentRouter must pass enable_ccr=False to compressors
+        when ccr_inject_marker=False. Before the fix, only SmartCrusher
+        received the flag — Search/Log/Diff compressors always got
+        enable_ccr=True (the default)."""
+        from headroom.transforms.content_router import (
+            ContentRouter,
+            ContentRouterConfig,
+        )
+
+        router = ContentRouter(ContentRouterConfig(ccr_inject_marker=False, ccr_enabled=True))
+
+        # search compressor
+        sc = router._get_search_compressor()
+        assert sc is not None
+        assert sc.config.enable_ccr is False, (
+            f"SearchCompressor enable_ccr={sc.config.enable_ccr}, expected False"
+        )
+
+        # log compressor
+        lc = router._get_log_compressor()
+        assert lc is not None
+        assert lc.config.enable_ccr is False, (
+            f"LogCompressor enable_ccr={lc.config.enable_ccr}, expected False"
+        )
+
+        # diff compressor
+        dc = router._get_diff_compressor()
+        assert dc is not None
+        assert dc.config.enable_ccr is False, (
+            f"DiffCompressor enable_ccr={dc.config.enable_ccr}, expected False"
+        )
+
+        # SmartCrusher already works (regression guard)
+        sc2 = router._get_smart_crusher()
+        assert sc2 is not None
+        # SmartCrusher uses inject_retrieval_marker, not enable_ccr
+
+    def test_content_router_default_ccr_inject_marker_true(self):
+        """Default config (ccr_inject_marker=True) should give enable_ccr=True."""
+        from headroom.transforms.content_router import (
+            ContentRouter,
+            ContentRouterConfig,
+        )
+
+        router = ContentRouter(ContentRouterConfig())
+        sc = router._get_search_compressor()
+        assert sc.config.enable_ccr is True
+
+        lc = router._get_log_compressor()
+        assert lc.config.enable_ccr is True
+
+        dc = router._get_diff_compressor()
+        assert dc.config.enable_ccr is True
+
+    def test_search_compressor_suppresses_markers_with_enable_ccr_false(self):
+        """SearchCompressor with enable_ccr=False must not emit <<ccr: markers."""
+        from headroom.transforms.search_compressor import (
+            SearchCompressor,
+            SearchCompressorConfig,
+        )
+
+        compressor = SearchCompressor(
+            SearchCompressorConfig(
+                enable_ccr=False,
+                min_matches_for_ccr=1,
+                context_keywords=["error"],
+            )
+        )
+        content = "\n".join(
+            f"src/file{i}.py:{line}: error: something went wrong here"
+            for i in range(20)
+            for line in range(1, 11)
+        )
+        result = compressor.compress(content)
+        assert "<<ccr:" not in result.compressed, (
+            f"SearchCompressor emitted marker when enable_ccr=False: {result.compressed[:300]!r}"
+        )
+
+    def test_log_compressor_suppresses_markers_with_enable_ccr_false(self):
+        """LogCompressor with enable_ccr=False must not emit <<ccr: markers."""
+        from headroom.transforms.log_compressor import (
+            LogCompressor,
+            LogCompressorConfig,
+        )
+
+        npm_lines = ["npm WARN deprecated x"] * 30 + ["npm ERR! something broke"] * 5
+        content = "\n".join(npm_lines)
+        compressor = LogCompressor(LogCompressorConfig(enable_ccr=False, min_lines_for_ccr=3))
+        result = compressor.compress(content)
+        assert "<<ccr:" not in result.compressed, (
+            f"LogCompressor emitted marker when enable_ccr=False: {result.compressed[:300]!r}"
+        )
+
+    def test_diff_compressor_suppresses_markers_with_enable_ccr_false(self):
+        """DiffCompressor with enable_ccr=False must not emit <<ccr: markers."""
+        from headroom.transforms.diff_compressor import (
+            DiffCompressor,
+            DiffCompressorConfig,
+        )
+
+        compressor = DiffCompressor(DiffCompressorConfig(enable_ccr=False, min_lines_for_ccr=10))
+        diff_lines = []
+        for i in range(30):
+            diff_lines.append(f"diff --git a/src/file{i}.py b/src/file{i}.py")
+            diff_lines.append(f"--- a/src/file{i}.py")
+            diff_lines.append(f"+++ b/src/file{i}.py")
+            for line in range(1, 6):
+                diff_lines.append(f"+added line {line} in file {i}")
+                diff_lines.append(f"-removed line {line} in file {i}")
+        content = "\n".join(diff_lines)
+        result = compressor.compress(content)
+        assert "<<ccr:" not in result.compressed, (
+            f"DiffCompressor emitted marker when enable_ccr=False: {result.compressed[:300]!r}"
+        )
+
+    def test_code_compressor_suppresses_markers_with_enable_ccr_false(self):
+        """CodeAwareCompressor with enable_ccr=False must not emit <<ccr:
+        markers when tree-sitter is available (#1022 coverage gap)."""
+        from headroom.transforms.code_compressor import (
+            CodeAwareCompressor,
+            CodeCompressorConfig,
+            _check_tree_sitter_available,
+        )
+
+        if not _check_tree_sitter_available():
+            pytest.skip("tree-sitter not available in this environment")
+
+        # Code that would compress with tree-sitter (enough to trigger CCR)
+        func_template = (
+            "def func_{i}(x: int) -> int:\n"
+            '    """Docstring for func_{i}."""\n'
+            "    # Line {j}\n"
+            "    result = x + {j}\n"
+            "    result *= 2\n"
+            "    return result\n"
+        )
+        content = "\n".join(func_template.format(i=i, j=j) for i in range(30) for j in range(1, 6))
+
+        compressor = CodeAwareCompressor(
+            CodeCompressorConfig(enable_ccr=False, min_tokens_for_compression=1)
+        )
+        result = compressor.compress(content)
+        assert "<<ccr:" not in result.compressed, (
+            f"CodeAwareCompressor emitted marker when enable_ccr=False: {result.compressed[:300]!r}"
+        )
 
 
 class TestArgparseBackendValidation:
@@ -813,6 +1317,38 @@ class TestArgparseBackendValidation:
             config = _proxy_config_from_env()
 
         assert config.disable_kompress is True
+
+    def test_proxy_config_from_env_reads_disable_kompress_fallback(self):
+        """The direct server env path should honor HEADROOM_DISABLE_KOMPRESS_FALLBACK."""
+        from headroom.proxy.server import _proxy_config_from_env
+
+        with patch.dict(os.environ, {"HEADROOM_DISABLE_KOMPRESS_FALLBACK": "1"}):
+            config = _proxy_config_from_env()
+
+        assert config.disable_kompress_fallback is True
+
+    def test_argparse_registers_keepalive_expiry_flag(self):
+        """The argparse path (python -m headroom.proxy.server) must register
+        --keepalive-expiry as a float flag, so it can override the
+        HEADROOM_KEEPALIVE_EXPIRY fallback. A bad value makes argparse exit
+        before the server boots, which both proves the flag exists and keeps
+        the test fast.
+        """
+        import subprocess
+        import sys
+
+        result = subprocess.run(
+            [sys.executable, "-m", "headroom.proxy.server", "--keepalive-expiry", "notafloat"],
+            capture_output=True,
+            text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+        assert result.returncode == 2, result.stderr
+        # "invalid float value" only appears if --keepalive-expiry is a registered
+        # float arg; a missing flag would instead say "unrecognized arguments".
+        assert "--keepalive-expiry" in result.stderr
+        assert "invalid float value" in result.stderr
 
 
 class TestCLIProxyExcludeToolsEnvVar:
@@ -930,3 +1466,153 @@ class TestCLIProxyExcludeToolsEnvVar:
 
         assert result.exit_code == 0, result.output
         assert captured_config["config"].tool_profiles is None
+
+
+class TestCLIProxyRpmTpm:
+    """--rpm/--tpm flags and HEADROOM_RPM/HEADROOM_TPM env vars must reach ProxyConfig."""
+
+    def test_rpm_default(self, runner):
+        """Without --rpm, rate_limit_requests_per_minute defaults to 60."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(main, ["proxy"], catch_exceptions=False)
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].rate_limit_requests_per_minute == 60
+
+    def test_rpm_flag(self, runner):
+        """--rpm 30 should set rate_limit_requests_per_minute to 30."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(main, ["proxy", "--rpm", "30"], catch_exceptions=False)
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].rate_limit_requests_per_minute == 30
+
+    def test_rpm_env_var(self, runner):
+        """HEADROOM_RPM=20 should set rate_limit_requests_per_minute to 20."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={"HEADROOM_RPM": "20"},
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].rate_limit_requests_per_minute == 20
+
+    def test_tpm_default(self, runner):
+        """Without --tpm, there is no token limit (the pre-0.39.0 behaviour)."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(main, ["proxy"], catch_exceptions=False)
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].rate_limit_tokens_per_minute is None
+
+    def test_tpm_flag(self, runner):
+        """--tpm 50000 should set rate_limit_tokens_per_minute to 50000."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(main, ["proxy", "--tpm", "50000"], catch_exceptions=False)
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].rate_limit_tokens_per_minute == 50000
+
+    def test_tpm_env_var(self, runner):
+        """HEADROOM_TPM=80000 should set rate_limit_tokens_per_minute to 80000."""
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={"HEADROOM_TPM": "80000"},
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].rate_limit_tokens_per_minute == 80000
+
+
+class TestSettingsFileToEnv:
+    """settings.json is applied to os.environ before Click parses envvar options.
+
+    Proves the file reaches both a parse-time ``envvar=`` option (HEADROOM_PORT)
+    and a body-resolved env read (HEADROOM_CODE_AWARE_ENABLED, which has no
+    Click ``envvar=``), and that an explicit shell export still wins.
+    """
+
+    def test_settings_file_reaches_parse_time_and_body_options(self, runner, tmp_path):
+        (tmp_path / "settings.json").write_text(
+            '{"port": 9898, "code_aware_enabled": false}', encoding="utf-8"
+        )
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={
+                    "HEADROOM_WORKSPACE_DIR": str(tmp_path),
+                    "HEADROOM_SETTINGS_PATH": None,
+                    # Ensure nothing ambient shadows the file-applied values.
+                    "HEADROOM_PORT": None,
+                    "HEADROOM_CODE_AWARE_ENABLED": None,
+                },
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].port == 9898
+        assert captured_config["config"].code_aware_enabled is False
+
+    def test_explicit_export_overrides_settings_file(self, runner, tmp_path):
+        (tmp_path / "settings.json").write_text('{"port": 9898}', encoding="utf-8")
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(
+                main,
+                ["proxy"],
+                env={
+                    "HEADROOM_WORKSPACE_DIR": str(tmp_path),
+                    "HEADROOM_SETTINGS_PATH": None,
+                    "HEADROOM_PORT": "7777",
+                },
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured_config["config"].port == 7777

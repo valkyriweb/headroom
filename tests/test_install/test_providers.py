@@ -16,6 +16,13 @@ from headroom.providers.codex.install import apply_provider_scope as apply_codex
 from headroom.providers.codex.install import build_install_env as build_codex_install_env
 from headroom.providers.codex.install import revert_provider_scope as revert_codex_provider_scope
 from headroom.providers.copilot.install import build_install_env as build_copilot_install_env
+from headroom.providers.opencode.install import (
+    apply_provider_scope as apply_opencode_provider_scope,
+)
+from headroom.providers.opencode.install import build_install_env as build_opencode_install_env
+from headroom.providers.opencode.install import (
+    revert_provider_scope as revert_opencode_provider_scope,
+)
 
 
 def _manifest(tmp_path: Path) -> DeploymentManifest:
@@ -91,6 +98,54 @@ def test_apply_codex_provider_scope_emits_flag_for_chatgpt_auth(
     apply_codex_provider_scope(manifest)
 
     assert "requires_openai_auth = true" in config_path.read_text()
+
+
+def test_apply_codex_provider_scope_lands_model_provider_at_root(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """model_provider must sit above the first [table] and override any prior value.
+
+    Codex scopes bare keys under the preceding table header, so appending the
+    provider block after an existing [table] (e.g. [features]) leaves
+    model_provider ignored and routing never switches (#260).
+    """
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('model_provider = "openai"\n\n[features]\nweb_search = true\n')
+    monkeypatch.setattr("headroom.providers.codex.install.codex_config_path", lambda: config_path)
+    manifest = _manifest(tmp_path)
+
+    apply_codex_provider_scope(manifest)
+
+    content = config_path.read_text()
+    # Prior "openai" assignment is overridden, not duplicated.
+    assert content.count("model_provider =") == 1
+    assert 'model_provider = "headroom"' in content
+    # The managed key must land before the first table header.
+    assert content.index('model_provider = "headroom"') < content.index("[features]")
+    # The user's own table survives.
+    assert "web_search = true" in content
+
+
+def test_apply_codex_provider_scope_preserves_table_scoped_provider_keys(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        'model_provider = "openai"\n\n'
+        "[profiles.work]\n"
+        'model_provider = "native"\n'
+        'openai_base_url = "https://example.invalid/v1"\n'
+    )
+    monkeypatch.setattr("headroom.providers.codex.install.codex_config_path", lambda: config_path)
+    manifest = _manifest(tmp_path)
+
+    apply_codex_provider_scope(manifest)
+
+    content = config_path.read_text()
+    assert content.count('model_provider = "headroom"') == 1
+    assert 'model_provider = "openai"' not in content
+    assert 'model_provider = "native"' in content
+    assert 'openai_base_url = "https://example.invalid/v1"' in content
 
 
 def test_codex_build_install_env_returns_proxy_base_url() -> None:
@@ -377,12 +432,74 @@ def test_apply_mutations_runs_openclaw_for_user_scope(monkeypatch, tmp_path: Pat
     assert [mutation.kind for mutation in mutations] == ["openclaw-wrap"]
 
 
+def test_provider_mutation_failure_reverts_prior_returned_record(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import headroom.providers.install_registry as registry
+
+    manifest = _manifest(tmp_path)
+    manifest.targets = ["first", "second"]
+    first = ManagedMutation(target="first", kind="first")
+    reverted: list[ManagedMutation] = []
+
+    def apply_first(current):
+        return first
+
+    def fail_second(current):
+        raise RuntimeError("second mutation failed")
+
+    def revert(mutation, current):
+        reverted.append(mutation)
+
+    monkeypatch.setattr(
+        registry,
+        "_PROVIDER_SCOPE_HANDLERS",
+        {"first": (apply_first, revert), "second": (fail_second, revert)},
+    )
+
+    with pytest.raises(RuntimeError, match="second mutation failed"):
+        registry.apply_provider_scope_mutations(manifest)
+    assert reverted == [first]
+
+
+def test_provider_rollback_failure_preserves_unreverted_records(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import headroom.providers.install_registry as registry
+
+    manifest = _manifest(tmp_path)
+    manifest.targets = ["first", "second"]
+    first = ManagedMutation(target="first", kind="first")
+
+    def apply_first(current):
+        return first
+
+    def fail_second(current):
+        raise RuntimeError("second mutation failed")
+
+    def fail_revert(mutation, current):
+        raise RuntimeError("rollback unavailable")
+
+    monkeypatch.setattr(
+        registry,
+        "_PROVIDER_SCOPE_HANDLERS",
+        {"first": (apply_first, fail_revert), "second": (fail_second, fail_revert)},
+    )
+
+    with pytest.raises(RuntimeError, match="rollback unavailable"):
+        registry.apply_provider_scope_mutations(manifest)
+    assert manifest.mutations == [first]
+
+
 def test_claude_build_install_env_returns_proxy_base_url() -> None:
     # Arrange / Act
     env = build_claude_install_env(port=5566, backend="ignored")
 
     # Assert
-    assert env == {"ANTHROPIC_BASE_URL": "http://127.0.0.1:5566"}
+    assert env == {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:5566",
+        "ENABLE_TOOL_SEARCH": "true",
+    }
 
 
 def test_copilot_build_install_env_uses_provider_type_specific_proxy_urls() -> None:
@@ -485,6 +602,88 @@ def test_revert_claude_provider_scope_ignores_missing_settings_file(tmp_path: Pa
 
 
 # ---------------------------------------------------------------------------
+# OpenCode provider tests
+# ---------------------------------------------------------------------------
+
+
+def test_opencode_build_install_env_leaves_provider_env_unset() -> None:
+    env = build_opencode_install_env(port=5566, backend="ignored")
+    assert env == {}
+
+
+def test_apply_and_revert_opencode_provider_scope(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "opencode.json"
+    config_path.write_text('{"model": "openai/gpt-4o"}')
+    monkeypatch.setattr(
+        "headroom.providers.opencode.install.opencode_config_path", lambda: config_path
+    )
+    manifest = _manifest(tmp_path)
+
+    mutation = apply_opencode_provider_scope(manifest)
+    assert mutation is not None
+    assert mutation.target == "opencode"
+    assert mutation.kind == "json-block"
+
+    content = config_path.read_text()
+    data = json.loads(content)
+    assert data["provider"]["headroom"]["options"]["baseURL"] == "http://127.0.0.1:8787/v1"
+    assert data["model"] == "openai/gpt-4o"  # user model preserved
+
+    revert_opencode_provider_scope(mutation, manifest)
+    reverted = json.loads(config_path.read_text())
+    assert reverted["model"] == "openai/gpt-4o"
+    assert "headroom" not in reverted.get("provider", {})
+
+
+def test_apply_opencode_provider_scope_skips_non_provider_scope(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "opencode.json"
+    monkeypatch.setattr(
+        "headroom.providers.opencode.install.opencode_config_path", lambda: config_path
+    )
+    manifest = _manifest(tmp_path)
+    manifest.scope = "user"
+
+    mutation = apply_opencode_provider_scope(manifest)
+    assert mutation is None
+    assert not config_path.exists()
+
+
+def test_apply_opencode_provider_scope_creates_new_config_when_missing(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "nested" / "opencode.json"
+    monkeypatch.setattr(
+        "headroom.providers.opencode.install.opencode_config_path", lambda: config_path
+    )
+    manifest = _manifest(tmp_path)
+
+    mutation = apply_opencode_provider_scope(manifest)
+    assert mutation is not None
+    data = json.loads(config_path.read_text())
+    assert data["provider"]["headroom"]["options"]["baseURL"] == "http://127.0.0.1:8787/v1"
+
+
+def test_revert_opencode_provider_scope_ignores_missing_path_and_file(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(tmp_path)
+    revert_opencode_provider_scope(
+        ManagedMutation(target="opencode", kind="json-block"),
+        manifest,
+    )
+    revert_opencode_provider_scope(
+        ManagedMutation(
+            target="opencode",
+            kind="json-block",
+            path=str(tmp_path / "missing.json"),
+        ),
+        manifest,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Bug 3 regression tests (#406): requires_openai_auth and openai_base_url
 # must never appear in the headroom provider block.
 # ---------------------------------------------------------------------------
@@ -542,6 +741,10 @@ def test_inject_codex_provider_config_writes_openai_base_url(
     home = tmp_path
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
+    (home / ".codex").mkdir()
+    (home / ".codex" / "auth.json").write_text(
+        '{"OPENAI_API_KEY": "sk-test-only"}', encoding="utf-8"
+    )
 
     wrap_mod._inject_codex_provider_config(8787)
 
@@ -564,6 +767,8 @@ def test_inject_codex_provider_config_writes_openai_base_url(
     assert "requires_openai_auth" not in content, (
         f"requires_openai_auth must be absent from the injected provider block; got:\n{content}"
     )
+    assert "auth = { command =" in content
+    assert "sk-test-only" not in content
     # openai_base_url must be in the top-level block, NOT inside [model_providers.*]
     lines = content.splitlines()
     in_provider_section = False
@@ -696,3 +901,286 @@ def test_persistent_install_strip_removes_openai_base_url(monkeypatch, tmp_path:
         f"orphaned openai_base_url must be removed by revert:\n{orphan_reverted}"
     )
     assert 'model = "gpt-4o"' in orphan_reverted
+
+
+# ---------------------------------------------------------------------------
+# Planner-level opencode smoke tests
+# ---------------------------------------------------------------------------
+
+
+def test_planner_resolves_opencode_as_install_target() -> None:
+    from headroom.install.planner import resolve_targets
+
+    targets = resolve_targets("manual", ["opencode"])
+    assert "opencode" in targets
+
+
+def test_planner_opencode_in_supported_targets_enum() -> None:
+    from headroom.install.models import ToolTarget
+    from headroom.install.planner import PROVIDER_SCOPE_TARGETS, SUPPORTED_TARGETS
+
+    assert ToolTarget.OPENCODE in SUPPORTED_TARGETS
+    assert ToolTarget.OPENCODE in PROVIDER_SCOPE_TARGETS
+
+
+def test_planner_opencode_in_provider_scope_targets() -> None:
+    from headroom.install.planner import resolve_targets
+
+    targets = resolve_targets("manual", ["opencode"], scope="provider")
+    assert "opencode" in targets
+
+
+def test_planner_build_tool_envs_includes_opencode() -> None:
+    from headroom.install.planner import build_tool_envs
+
+    envs = build_tool_envs(port=8787, backend="anthropic", targets=["opencode"])
+    assert "opencode" in envs
+    assert envs["opencode"] == {}
+
+
+def test_planner_resolve_all_includes_opencode() -> None:
+    from headroom.install.planner import resolve_targets
+
+    targets = resolve_targets("all", [])
+    assert "opencode" in targets
+
+
+def test_planner_provider_scope_unsupported_error_excludes_opencode() -> None:
+    import click
+    import pytest
+
+    from headroom.install.planner import resolve_targets
+
+    with pytest.raises(click.ClickException, match="unsupported targets"):
+        resolve_targets("manual", ["cursor"], scope="provider")
+
+
+# ---------------------------------------------------------------------------
+# Planner-level antigravity smoke tests
+# ---------------------------------------------------------------------------
+
+
+def test_planner_resolves_antigravity_as_install_target() -> None:
+    from headroom.install.planner import resolve_targets
+
+    targets = resolve_targets("manual", ["antigravity"])
+    assert "antigravity" in targets
+
+
+def test_planner_antigravity_in_supported_targets_enum() -> None:
+    from headroom.install.models import ToolTarget
+    from headroom.install.planner import PROVIDER_SCOPE_TARGETS, SUPPORTED_TARGETS
+
+    assert ToolTarget.ANTIGRAVITY in SUPPORTED_TARGETS
+    assert ToolTarget.ANTIGRAVITY not in PROVIDER_SCOPE_TARGETS
+
+
+def test_planner_antigravity_rejected_in_provider_scope() -> None:
+    import click
+    import pytest
+
+    from headroom.install.planner import resolve_targets
+
+    with pytest.raises(click.ClickException, match="unsupported targets"):
+        resolve_targets("manual", ["antigravity"], scope="provider")
+
+
+def test_planner_build_tool_envs_includes_antigravity() -> None:
+    from headroom.install.planner import build_tool_envs
+
+    envs = build_tool_envs(port=8787, backend="anthropic", targets=["antigravity"])
+    assert "antigravity" in envs
+    assert envs["antigravity"]["OPENAI_BASE_URL"] == "http://127.0.0.1:8787/v1"
+    assert envs["antigravity"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8787"
+
+
+def test_planner_resolve_all_includes_antigravity() -> None:
+    from headroom.install.planner import resolve_targets
+
+    targets = resolve_targets("all", [])
+    assert "antigravity" in targets
+
+
+def test_planner_detect_targets_ignores_bare_gemini_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pathlib import Path as StdPath
+
+    from headroom.install.planner import detect_targets
+
+    # Gemini CLI keeps its own session data under ~/.gemini/, so the shared
+    # home directory alone must not count as an Antigravity install.
+    (tmp_path / ".gemini").mkdir()
+    monkeypatch.setattr(StdPath, "home", classmethod(lambda cls: tmp_path))
+
+    assert "antigravity" not in detect_targets()
+
+
+# ---------------------------------------------------------------------------
+# Opencode revert OSError fallback
+# ---------------------------------------------------------------------------
+
+
+def test_revert_opencode_provider_scope_fallback_on_oserror(monkeypatch, tmp_path: Path) -> None:
+    """revert_opencode_provider_scope falls back to strip when backup copy fails."""
+    config_path = tmp_path / "opencode.json"
+    backup_path = config_path.with_suffix(".json.headroom-backup")
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    from headroom.install.models import ManagedMutation
+    from headroom.providers.opencode.config import (
+        _PROVIDER_MARKER_END,
+        _PROVIDER_MARKER_START,
+    )
+
+    original = '{"model": "openai/gpt-4o"}'
+    backup_path.write_text(original)
+
+    provider_json = '{"headroom":{"npm":"@ai-sdk/openai-compatible","name":"Headroom Proxy","options":{"baseURL":"http://127.0.0.1:8787/v1"}}}'
+    config_path.write_text(
+        f'{_PROVIDER_MARKER_START}\n"provider": {provider_json},\n{_PROVIDER_MARKER_END}\n'
+    )
+
+    monkeypatch.setattr(
+        "headroom.providers.opencode.install.opencode_config_path",
+        lambda: config_path,
+    )
+
+    from headroom.providers.opencode.install import revert_provider_scope
+
+    manifest = _manifest(tmp_path)
+
+    def _fail_copy2(src, dst):
+        msg = "permission denied"
+        raise OSError(msg)
+
+    monkeypatch.setattr("shutil.copy2", _fail_copy2)
+
+    revert_provider_scope(
+        ManagedMutation(target="opencode", kind="json-block", path=str(config_path)),
+        manifest,
+    )
+
+    assert backup_path.exists()  # backup preserved when copy fails
+    assert not config_path.exists() or "headroom" not in config_path.read_text()
+
+
+def test_apply_mutations_records_each_provider_mutation_once(monkeypatch, tmp_path: Path) -> None:
+    import headroom.providers.install_registry as registry
+    from headroom.install.providers import apply_mutations
+
+    manifest = _manifest(tmp_path)
+    manifest.targets = ["first"]
+    first = ManagedMutation(target="first", kind="first")
+    monkeypatch.setattr(
+        registry,
+        "_PROVIDER_SCOPE_HANDLERS",
+        {"first": (lambda current: first, lambda mutation, current: None)},
+    )
+
+    assert apply_mutations(manifest) == [first]
+    assert manifest.mutations == [first]
+
+
+def test_unix_env_failure_restores_previous_shell_contents(monkeypatch, tmp_path: Path) -> None:
+    from headroom import fsutil
+    from headroom.install import providers
+
+    manifest = _manifest(tmp_path)
+    manifest.scope = "user"
+    bashrc = tmp_path / ".bashrc"
+    zshrc = tmp_path / ".zshrc"
+    previous = (
+        '# >>> headroom persistent env >>>\nexport OLD="1"\n# <<< headroom persistent env <<<\n'
+    )
+    bashrc.write_text(previous, encoding="utf-8")
+    monkeypatch.setattr(providers, "unix_user_env_targets", lambda: [bashrc, zshrc])
+    real_write = fsutil.write_text
+
+    def write_text(path, content):
+        if Path(path) == zshrc:
+            raise OSError("disk full")
+        real_write(path, content)
+
+    monkeypatch.setattr(fsutil, "write_text", write_text)
+
+    with pytest.raises(OSError, match="disk full"):
+        providers._apply_unix_env_scope(manifest)
+    assert bashrc.read_text(encoding="utf-8") == previous
+    assert not zshrc.exists()
+
+
+def test_unix_env_failure_restores_earlier_targets_when_existing_target_rejects_writes(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from headroom import fsutil
+    from headroom.install import providers
+
+    manifest = _manifest(tmp_path)
+    manifest.scope = "user"
+    bashrc = tmp_path / ".bashrc"
+    zshrc = tmp_path / ".zshrc"
+    bashrc.write_text("# bash\n", encoding="utf-8")
+    zshrc.write_text("# zsh\n", encoding="utf-8")
+    monkeypatch.setattr(providers, "unix_user_env_targets", lambda: [bashrc, zshrc])
+    real_write = fsutil.write_text
+
+    def write_text(path, content):
+        if Path(path) == zshrc:
+            raise OSError("read-only")
+        real_write(path, content)
+
+    monkeypatch.setattr(fsutil, "write_text", write_text)
+
+    with pytest.raises(OSError, match="read-only"):
+        providers._apply_unix_env_scope(manifest)
+    assert bashrc.read_text(encoding="utf-8") == "# bash\n"
+    assert zshrc.read_text(encoding="utf-8") == "# zsh\n"
+
+
+def test_unix_env_block_round_trips_shell_special_values(monkeypatch, tmp_path: Path) -> None:
+    import shlex
+    import shutil
+    import subprocess
+    import sys
+
+    from headroom.install import providers
+
+    # System32 bash.exe is the WSL launcher and cannot open a Windows fixture path.
+    if sys.platform == "win32":
+        pytest.skip("Unix shell rc round-trip is not supported on Windows")
+    shell = shutil.which("bash")
+    if shell is None:
+        pytest.skip("bash not available")
+    manifest = _manifest(tmp_path)
+    manifest.scope = "user"
+    manifest.base_env = {
+        "HTTPS_PROXY": "http://bob:pa$$w0rd@proxy:3128",
+        "HEADROOM_JSON": '{"a": "b"}',
+        "HEADROOM_TICK": "`id`",
+    }
+    bashrc = tmp_path / "dir with spaces" / ".bashrc"
+    bashrc.parent.mkdir()
+    monkeypatch.setattr(providers, "unix_user_env_targets", lambda: [bashrc])
+
+    providers._apply_unix_env_scope(manifest)
+    # Re-apply over the existing block, with a value containing backslashes.
+    manifest.base_env["HEADROOM_WORKSPACE_DIR"] = r"C:\new\dir \d+"
+    providers._apply_unix_env_scope(manifest)
+
+    quoted = shlex.quote(str(bashrc))
+    readable = subprocess.run(
+        [shell, "-c", f"test -r {quoted}"],
+        capture_output=True,
+        text=True,
+    )
+    if readable.returncode != 0:
+        pytest.skip("selected shell cannot read the fixture path")
+
+    names = list(manifest.base_env)
+    prints = " && ".join(f'printf "%s\\0" "${name}"' for name in names)
+    # A failed source must fail the script; a following printf must not mask it.
+    script = f"source {quoted} && {prints}"
+    result = subprocess.run([shell, "-c", script], capture_output=True, text=True, check=True)
+    assert result.stdout.split("\0")[:-1] == list(manifest.base_env.values())
+    assert bashrc.read_text(encoding="utf-8").count("# >>> headroom persistent env >>>") == 1

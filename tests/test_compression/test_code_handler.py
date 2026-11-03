@@ -1,9 +1,12 @@
 """Tests for code structure handler."""
 
+from unittest.mock import patch
+
 import pytest
 
 from headroom.compression.handlers.code_handler import (
     CodeStructureHandler,
+    _check_tree_sitter,
     is_tree_sitter_available,
 )
 
@@ -70,6 +73,10 @@ class TestLanguageDetection:
         code = "use std::io;\n\npub fn main() {\n    let mut x = 1;\n}\n"
         assert handler._detect_language(code) == "rust"
 
+    def test_detects_perl(self, handler):
+        code = "use strict;\npackage Foo;\n\nsub greet {\n    my $name = shift;\n    return $name;\n}\n"
+        assert handler._detect_language(code) == "perl"
+
     def test_falls_back_to_default(self):
         handler = CodeStructureHandler(default_language="javascript")
         assert handler._detect_language("plain words only here") == "javascript"
@@ -110,9 +117,64 @@ class TestRegexFallbackLanguages:
         start = code.index(sig)
         assert all(result.mask.mask[i] for i in range(start, start + len(sig)))
 
+    def test_perl_sub_signature_preserved(self, handler):
+        code = "sub add {\n    my ($a, $b) = @_;\n    return $a + $b;\n}\n"
+        result = handler.get_mask(code, language="perl")
+        sig = "sub add"
+        start = code.index(sig)
+        assert all(result.mask.mask[i] for i in range(start, start + len(sig)))
+
+    def test_perl_use_import_preserved(self, handler):
+        code = "use strict;\nuse warnings;\n\nmy $x = 1;\n"
+        result = handler.get_mask(code, language="perl")
+        assert all(result.mask.mask[i] for i in range(len("use strict")))
+
     def test_regex_confidence_lower_than_tree_sitter(self, handler):
         result = handler.get_mask("def f():\n    pass\n", language="python")
         assert result.confidence == 0.7
+
+
+class TestAvailabilityProbe:
+    """_check_tree_sitter must exercise a real parse, not just an import."""
+
+    def test_abi_mismatch_returns_false(self):
+        import types
+
+        import headroom.compression.handlers.code_handler as mod
+
+        mod._tree_sitter_available = None
+
+        fake_ts = types.ModuleType("tree_sitter")
+
+        class FakeParser:
+            def __setattr__(self, name, value):
+                if name == "language":
+                    raise RuntimeError("ABI mismatch")
+                super().__setattr__(name, value)
+
+        fake_ts.Parser = FakeParser
+
+        fake_pack = types.ModuleType("tree_sitter_language_pack")
+        fake_pack.get_language = lambda name: object()
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "tree_sitter": fake_ts,
+                "tree_sitter_language_pack": fake_pack,
+            },
+        ):
+            result = _check_tree_sitter()
+        assert result is False
+        mod._tree_sitter_available = None
+
+    @requires_tree_sitter
+    def test_healthy_install_returns_true(self):
+        import headroom.compression.handlers.code_handler as mod
+
+        mod._tree_sitter_available = None
+        assert _check_tree_sitter() is True
+        mod._tree_sitter_available = None
 
 
 class TestEdgeCases:
@@ -291,3 +353,40 @@ class TestTreeSitterContainers:
             f"class code preserved {result.preservation_ratio:.0%} — "
             "container bodies are leaking into the structural mask"
         )
+
+
+class TestByteSpanToCharSpan:
+    """_byte_spans_to_char_spans must map tree-sitter byte offsets to character
+    offsets. The ASCII fast path returns spans unchanged (byte == char) without
+    allocating a UTF-8 copy; the non-ASCII path derives each character's width
+    from its code point instead of re-encoding it."""
+
+    def test_ascii_returns_spans_unchanged(self):
+        from headroom.compression.handlers.code_handler import CodeSpan
+
+        spans = [
+            CodeSpan(start=0, end=5, role="sig", is_structural=True),
+            CodeSpan(start=6, end=11, role="body", is_structural=False),
+        ]
+        out = CodeStructureHandler._byte_spans_to_char_spans(spans, "def f():\n    pass\n")
+        assert [(s.start, s.end) for s in out] == [(0, 5), (6, 11)]
+
+    def test_non_ascii_remaps_byte_offsets_to_char_offsets(self):
+        from headroom.compression.handlers.code_handler import CodeSpan
+
+        # café (é = 2 bytes), 🚀 (4 bytes), 语言 (3 bytes each).
+        content = "x = 'café 🚀 语言'\n"
+        enc = content.encode("utf-8")
+        # A structural span covering the whole line, plus one covering 'return'-like
+        # region: give byte offsets and expect character offsets back.
+        whole = CodeSpan(start=0, end=len(enc), role="body", is_structural=True)
+        # byte offset of the closing quote vs its character offset
+        quote_byte = enc.rindex(b"'")
+        quote_char = content.rindex("'")
+        marker = CodeSpan(start=quote_byte, end=len(enc), role="sig", is_structural=True)
+
+        out = CodeStructureHandler._byte_spans_to_char_spans([whole, marker], content)
+        assert out[0].start == 0
+        assert out[0].end == len(content)  # exclusive end maps to char length
+        assert out[1].start == quote_char  # byte offset correctly remapped
+        assert out[1].end == len(content)

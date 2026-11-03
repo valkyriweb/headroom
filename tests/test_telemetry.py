@@ -502,6 +502,30 @@ class TestTelemetryCollector:
         assert len(collector._events) <= 5
 
 
+class TestEmptyItemsSignature:
+    """Empty-item compressions must not create a new tool signature each time."""
+
+    def test_empty_signature_is_stable(self):
+        assert (
+            ToolSignature.from_items([]).structure_hash
+            == ToolSignature.from_items([]).structure_hash
+        )
+
+    def test_repeated_empty_compressions_share_one_tool_stat(self):
+        collector = TelemetryCollector()
+        for _ in range(50):
+            collector.record_compression(
+                items=[],
+                original_count=0,
+                compressed_count=0,
+                original_tokens=10,
+                compressed_tokens=10,
+                strategy="none",
+            )
+
+        assert len(collector.get_all_tool_stats()) == 1
+
+
 class TestTelemetryPersistence:
     """Test telemetry persistence to disk."""
 
@@ -584,8 +608,8 @@ class TestGlobalTelemetryCollector:
         Pre-#390 the collector only honoured HEADROOM_TELEMETRY_DISABLED, which
         is undocumented. Users following the docs set HEADROOM_TELEMETRY=off and
         watched /v1/telemetry continue to report enabled=true. The collector now
-        consults `is_telemetry_enabled()` (the same predicate the Supabase beacon
-        uses), so both env vars take effect.
+        consults `is_telemetry_enabled()` (the documented opt-in predicate),
+        so both env vars take effect.
         """
         reset_telemetry_collector()
         monkeypatch.delenv("HEADROOM_TELEMETRY_DISABLED", raising=False)
@@ -601,7 +625,9 @@ class TestGlobalTelemetryCollector:
         )
 
     def test_headroom_telemetry_on_keeps_collector_enabled(self, monkeypatch):
-        """Sanity check: the explicit on/unset path leaves the collector enabled."""
+        """Sanity check: the explicit opt-in path (HEADROOM_TELEMETRY=on) leaves
+        the collector enabled. Telemetry is off by default, so this requires the
+        user to have turned it on."""
         reset_telemetry_collector()
         monkeypatch.delenv("HEADROOM_TELEMETRY_DISABLED", raising=False)
         monkeypatch.setenv("HEADROOM_TELEMETRY", "on")

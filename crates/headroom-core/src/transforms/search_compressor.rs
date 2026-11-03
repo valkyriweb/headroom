@@ -70,6 +70,35 @@ use md5::{Digest, Md5};
 
 use crate::ccr::CcrStore;
 use crate::signals::{ImportanceContext, LineImportanceDetector};
+
+/// True for CJK ideographs, kana, and Hangul.
+fn is_cjk_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF
+    )
+}
+
+/// CJK character bigrams from the CJK runs of a (lowercased) query, so a
+/// spaceless CJK query can match content.
+fn cjk_bigrams(text: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut run: Vec<char> = Vec::new();
+    for c in text.chars() {
+        if is_cjk_char(c) {
+            run.push(c);
+        } else {
+            for w in run.windows(2) {
+                out.insert(w.iter().collect::<String>());
+            }
+            run.clear();
+        }
+    }
+    for w in run.windows(2) {
+        out.insert(w.iter().collect::<String>());
+    }
+    out
+}
 use crate::transforms::adaptive_sizer::compute_optimal_k;
 
 // ─── Types ──────────────────────────────────────────────────────────────
@@ -363,10 +392,15 @@ impl SearchCompressor {
 
     pub fn score_matches(&self, files: &mut BTreeMap<String, FileMatches>, context: &str) {
         let context_lower = context.to_ascii_lowercase();
-        let context_words: Vec<&str> = context_lower
+        // Dedup like Python's `set`; count length in CHARS (not bytes) to match
+        // Python codepoints; and add CJK char bigrams so a spaceless CJK query
+        // (no whitespace words to split on) can still match content.
+        let mut context_words: BTreeSet<String> = context_lower
             .split_whitespace()
-            .filter(|w| w.len() > 2)
+            .filter(|w| w.chars().count() > 2)
+            .map(|w| w.to_string())
             .collect();
+        context_words.extend(cjk_bigrams(&context_lower));
 
         for fm in files.values_mut() {
             for m in &mut fm.matches {
@@ -374,7 +408,7 @@ impl SearchCompressor {
                 let content_lower = m.content.to_ascii_lowercase();
 
                 for w in &context_words {
-                    if content_lower.contains(w) {
+                    if content_lower.contains(w.as_str()) {
                         score += 0.3;
                     }
                 }
@@ -417,9 +451,8 @@ impl SearchCompressor {
         bias: f64,
         stats: &mut SearchCompressorStats,
     ) -> BTreeMap<String, FileMatches> {
-        // Python `_select_matches` sorts files by total match score
-        // descending. `BTreeMap` iterates in key order, so we collect
-        // and sort explicitly.
+        // Sort files by total match score, descending. `BTreeMap`
+        // iterates in key order, so we collect and sort explicitly.
         let mut by_score: Vec<(&String, &FileMatches)> = files.iter().collect();
         by_score.sort_by(|a, b| {
             b.1.total_score()
@@ -590,7 +623,193 @@ impl SearchCompressor {
 /// Returns `None` for lines that don't match the shape (no
 /// `<sep>\d+<sep>` found). Caller treats those as un-parseable and
 /// drops them.
+///
+/// # Why the scan runs in tiers
+///
+/// Leftmost-wins alone misreads any *path segment* that itself contains
+/// a `<sep>\d+<sep>` triplet, which is extremely common:
+///
+/// ```text
+/// logs/2026-05-03/app.log:12:ERROR   -> ("logs/2026", 5, "03/app.log:12:ERROR")
+/// advisories/CVE-2021-44228.md-9-ctx -> ("advisories/CVE", 2021, "44228.md-9-ctx")
+/// ```
+///
+/// That is silent corruption, not a drop — the bogus path becomes the
+/// grouping key in [`SearchCompressor::parse_search_results`], so the
+/// model is shown a file and a line number that do not exist, plus a
+/// body with a path fragment glued onto the front.
+///
+/// The tiers exploit what grep actually emits:
+///
+/// 1. **Colon tier** — leftmost `:\d+:` whose path part contains no
+///    whitespace. `:` is grep's *match*-line separator and a path
+///    practically never contains one (the Windows drive colon is
+///    already skipped above), so the leftmost is the right one. The
+///    no-whitespace guard keeps a `foo.rs:12:` reference *inside the
+///    body* of a `-`-separated context line from hijacking the parse. A
+///    whitespace-free body reference (`a:7:b`) still slips past it, so
+///    [`parse_match_line`] hands priority back to the dash tier for that
+///    one shape; see the comment there.
+/// 2. **Dash tier** — `-` is grep's *context*-line separator, and unlike
+///    `:` it appears inside real paths (`2026-05-03`, `CVE-2021-44228`,
+///    `20240101-002-add_users.sql`), so the leftmost triplet is often
+///    still inside the path. The scan therefore walks rightward — but it
+///    only advances past a marker on *positive* evidence that the path
+///    continues through it: either the path so far ends in a segment with
+///    an extension (that marker is the boundary — stop), or the rest of
+///    the token still holds a `/` or a further extension (still inside
+///    the path — keep going). If the walk reaches the end of the token
+///    without ever finding that evidence, the line is genuinely ambiguous
+///    and the tier falls back to the leftmost marker — exactly what the
+///    permissive rule returns. On any line where it cannot prove it knows
+///    better, it agrees with the rule it refines.
+///
+///    One shape stays ambiguous *in principle*, and the tier knowingly
+///    takes the other side of it than the permissive rule does:
+///
+///    ```text
+///    advisories/CVE-2021-44228.md-9-ctx   -> file is CVE-2021-44228.md, line 9
+///    Makefile-7-build.sh-2-stage          -> file is Makefile, line 7
+///    ```
+///
+///    Both are `<stem>-<digits>-<name>.<ext>-<digits>-<rest>`. Nothing in
+///    the *text* separates them — only a filesystem could. The tier stops
+///    at the extension, so it reads the first correctly and the second
+///    wrong; the permissive rule takes the leftmost marker and does the
+///    reverse. That trade is deliberate: dated and CVE-style paths are
+///    everyday grep output, whereas the second shape needs a context line
+///    from an *extension-less* file whose body begins with a bare
+///    `name.ext-<digits>-` token. Both readings lose sometimes; this one
+///    loses far less often.
+/// 3. **Permissive tier** — the original leftmost-any rule, unchanged.
+///    Only reached when neither tier matched (e.g. a path containing a
+///    space), so behaviour for those lines is exactly as before.
 fn parse_match_line(line: &str) -> Option<(&str, u64, &str)> {
+    let colon = scan_marker(line, ScanTier::Colon);
+    let dash = scan_marker(line, ScanTier::Dash);
+
+    // The colon tier keeps priority: `path:line:content` is what grep emits for
+    // matches and a path practically never contains a colon. It yields in
+    // exactly one shape — a `-`-separated context line whose body carries a
+    // whitespace-free `name:N:` reference (`app.py-476-a:7:b`). The dash tier
+    // *positively confirmed* a boundary before the colon marker, so that colon
+    // triplet is body text, not a marker.
+    //
+    // Without the hand-off the body's number is read as the line number, the
+    // path swallows the real `-N-`, and the model is shown a file that does not
+    // exist holding content attributed to a line it never came from
+    // (issue #3545). The whitespace guard inside the colon tier cannot catch
+    // this, because the body ahead of the reference need not contain any.
+    //
+    // The `true` in the dash arm is load-bearing, and it is the *whole* test.
+    // A confirmed boundary means the dash tier saw the path end there — either
+    // the segment carried an extension (`app.py-476-`) or nothing after the
+    // marker looked like path structure (`CHANGELOG-12-`) — so the bytes from
+    // the closing dash onwards are body text and may look like anything. Bodies
+    // routinely carry a filename-style reference of their own
+    // (`app.py-476-foo.rs:12:ref`), and an extension dot there says nothing
+    // about where the path ended.
+    //
+    // The rows that must keep the colon tier are the ones where the dash tier
+    // could *not* confirm: `logs/2026-05-03/app.log:12:ERROR` and
+    // `migrations/20240101-002-add_users.sql:12:SELECT` both leave the digits
+    // inside the path, so the flag is false and the hand-off never applies. See
+    // [`path_continues`], which is what decides the flag.
+    let dash_overrides = match (colon, dash) {
+        (Some((colon_marker, _)), Some((dash_marker, true))) => colon_marker.0 > dash_marker.2,
+        _ => false,
+    };
+
+    let marker = if dash_overrides {
+        dash
+    } else {
+        colon
+            .or(dash)
+            .or_else(|| scan_marker(line, ScanTier::Permissive))
+    };
+
+    build_match(line, marker?.0)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanTier {
+    Colon,
+    Dash,
+    Permissive,
+}
+
+/// True when `tok` holds a dot that looks like a *file extension*: a run
+/// of 1–8 alphanumerics, at least one of them a letter, ending the token
+/// or bounded by a path/marker separator.
+///
+/// The letter requirement is what keeps a dotted *version* out of the
+/// extension test. `v1.2.3` and `rel.1.2` end in all-digit runs, so they
+/// are not extensions — which matters because they show up in the bodies
+/// of context lines from extension-less files (`git describe` output in a
+/// `Makefile`, a version bump in a `CHANGELOG`), and reading one as an
+/// extension is what lets the dash tier walk out of the path and into the
+/// body. `.md`, `.sql`, `.log`, `.7z` all still qualify.
+fn has_extension_dot(tok: &str) -> bool {
+    let b = tok.as_bytes();
+    b.iter().enumerate().any(|(i, &c)| {
+        if c != b'.' || i + 1 == b.len() {
+            return false;
+        }
+        let tail = &b[i + 1..];
+        let end = tail
+            .iter()
+            .position(|c| !c.is_ascii_alphanumeric())
+            .unwrap_or(tail.len());
+        let ext = &tail[..end];
+        (1..=8).contains(&ext.len()) && ext.iter().any(|c| c.is_ascii_alphabetic())
+    })
+}
+
+/// True when `path`'s final segment carries a file extension.
+///
+/// The dash tier uses this to tell "these digits are still inside the
+/// path" (`logs/2026`, no extension → keep scanning) from "these digits
+/// are the line-number marker" (`logs/2026-05-03/app.log` → stop).
+fn last_segment_has_extension(path: &str) -> bool {
+    has_extension_dot(path.rsplit(['/', '\\']).next().unwrap_or(path))
+}
+
+/// True when the token after this marker still carries *path structure* —
+/// a directory separator or an extension dot — before the next whitespace.
+///
+/// This is the positive evidence that the digits just matched were still
+/// inside the path rather than the line-number marker. Both forms occur:
+///
+/// ```text
+/// logs/2026-05-03/app.log             -> the path continues via `/`
+/// migrations/20240101-002-add_users.sql -> ...and here via `.`, same directory
+/// ```
+///
+/// Its absence is *not* proof of the opposite, which is why the caller
+/// falls back to the leftmost marker rather than reading "no evidence" as
+/// "keep walking".
+fn path_continues(rest: &str) -> bool {
+    rest.split_whitespace()
+        .next()
+        .is_some_and(|tok| tok.contains('/') || tok.contains('\\') || has_extension_dot(tok))
+}
+
+/// Byte offsets of one `<sep><digits><sep>` marker: where the path ends, where
+/// the digits start, and where the closing separator sits.
+type Marker = (usize, usize, usize);
+
+/// Assemble `(file, line_number, content)` from a marker's byte offsets.
+fn build_match(line: &str, marker: Marker) -> Option<(&str, u64, &str)> {
+    let (path_end, digits_start, digits_end) = marker;
+    let line_no = line[digits_start..digits_end].parse::<u64>().ok()?;
+    Some((&line[..path_end], line_no, &line[digits_end + 1..]))
+}
+
+/// Scan `line` under `tier`, returning the marker it settled on plus whether
+/// that marker was a *positively confirmed* boundary (`chosen`) rather than the
+/// leftmost fallback (`first`). Callers need that flag to tell a proven boundary
+/// from a guess.
+fn scan_marker(line: &str, tier: ScanTier) -> Option<(Marker, bool)> {
     let bytes = line.as_bytes();
     // Windows drive prefix: starts with [A-Za-z]:[\\/]
     let scan_start = if bytes.len() >= 3
@@ -605,9 +824,24 @@ fn parse_match_line(line: &str) -> Option<(&str, u64, &str)> {
         0
     };
 
+    // Candidates as (path_end, digits_start, digits_end).
+    //
+    // `first` is the leftmost marker — the answer the permissive
+    // leftmost-wins rule gives, and the fallback when the dash tier
+    // cannot prove a better one. `chosen` is a marker positively
+    // confirmed as the path/body boundary.
+    let mut first: Option<(usize, usize, usize)> = None;
+    let mut chosen: Option<(usize, usize, usize)> = None;
+
     let mut i = scan_start;
     while i < bytes.len() {
-        if bytes[i] == b':' || bytes[i] == b'-' {
+        let is_sep = bytes[i] == b':' || bytes[i] == b'-';
+        let tier_sep = match tier {
+            ScanTier::Colon => bytes[i] == b':',
+            ScanTier::Dash => bytes[i] == b'-',
+            ScanTier::Permissive => is_sep,
+        };
+        if tier_sep {
             // Reject markers where the byte immediately before the
             // first separator is itself a separator. That collapses
             // adjacent-separator runs (`::` or `:-`) so a line like
@@ -619,29 +853,76 @@ fn parse_match_line(line: &str) -> Option<(&str, u64, &str)> {
                 i += 1;
                 continue;
             }
+            // The typed tiers only consider markers that sit inside the
+            // leading whitespace-free run — grep paths don't contain
+            // whitespace, bodies routinely do.
+            if tier != ScanTier::Permissive && bytes[..i].iter().any(|b| b.is_ascii_whitespace()) {
+                break;
+            }
             // Try this as the first separator. Walk through digits.
             let digits_start = i + 1;
             let mut j = digits_start;
             while j < bytes.len() && bytes[j].is_ascii_digit() {
                 j += 1;
             }
-            if j > digits_start && j < bytes.len() && (bytes[j] == b':' || bytes[j] == b'-') {
+            // The closing separator must match the opening one: grep
+            // emits `file:12:body` or `file-12-body`, never a mix.
+            let closes = j > digits_start
+                && j < bytes.len()
+                && match tier {
+                    ScanTier::Permissive => bytes[j] == b':' || bytes[j] == b'-',
+                    _ => bytes[j] == bytes[i],
+                };
+            if closes {
                 // Found <sep><digits><sep>. Reject zero-length path
                 // (line starts with separator).
                 if i == 0 {
                     return None;
                 }
-                let file = &line[..i];
-                let line_no = std::str::from_utf8(&bytes[digits_start..j])
-                    .ok()
-                    .and_then(|s| s.parse::<u64>().ok())?;
-                let content = &line[j + 1..];
-                return Some((file, line_no, content));
+                if first.is_none() {
+                    first = Some((i, digits_start, j));
+                }
+                if tier != ScanTier::Dash {
+                    chosen = Some((i, digits_start, j));
+                    break;
+                }
+                // Dash tier: advance past this marker only on *positive*
+                // evidence that the path runs through it. Stop when
+                // either
+                //   (a) the path so far ends in a segment with an
+                //       extension — that marker is the boundary
+                //       (`logs/2026-05-03/app.log-12-…`), or
+                //   (b) the rest of the token carries no further path
+                //       structure — no `/` and no `.` — so nothing
+                //       suggests the path continues
+                //       (`CHANGELOG-12-2026-05-03`).
+                // Otherwise the digits are still inside the path
+                // (`logs/2026` + `03/app.log…`) and a later marker is the
+                // real one.
+                //
+                // Advancing on the *absence* of a stop signal is what
+                // breaks here: neither whitespace nor an extension is
+                // guaranteed to appear, so a walk bounded that way runs
+                // off the end of the path and latches onto a triplet in
+                // the *body* — silently, and for exactly the paths that
+                // carry no extension (`Makefile`, `Dockerfile`,
+                // `LICENSE`, `.github/workflows/ci`).
+                if last_segment_has_extension(&line[..i]) || !path_continues(&line[j + 1..]) {
+                    chosen = Some((i, digits_start, j));
+                    break;
+                }
+                i = j + 1;
+                continue;
             }
         }
         i += 1;
     }
-    None
+
+    // Walked the whole token without ever confirming a boundary: the line
+    // is genuinely ambiguous (`Makefile-7-include-2-src/foo.mk`). Fall back
+    // to the leftmost marker — precisely what the leftmost-wins rule this
+    // tier refines would have returned.
+    Some((chosen.or(first)?, chosen.is_some()))
 }
 
 // ─── Internals ──────────────────────────────────────────────────────────
@@ -679,6 +960,200 @@ mod tests {
         assert_eq!(
             parse_line("src/main.py:42:def main():"),
             Some(("src/main.py".into(), 42, "def main():".into()))
+        );
+    }
+
+    #[test]
+    fn cjk_bigrams_from_runs() {
+        let b = cjk_bigrams("认证令牌");
+        assert!(b.contains("认证") && b.contains("证令") && b.contains("令牌") && b.len() == 3);
+        assert!(cjk_bigrams("hello").is_empty());
+        assert!(cjk_bigrams("a认b证").is_empty()); // isolated CJK chars -> no pair
+    }
+
+    #[test]
+    fn dash_context_line_wins_over_a_colon_marker_in_its_body() {
+        // A whitespace-free `name:N:` reference in the body of a `-`-separated
+        // context line used to be read as the line-number marker: the path
+        // absorbed the real `-N-` and the body's number was reported as the
+        // line number, inventing both a file that does not exist and a
+        // line<->content pair that never existed (issue #3545).
+        assert_eq!(
+            parse_line("app/settings.py-476-a:7:b:8:c"),
+            Some(("app/settings.py".into(), 476, "a:7:b:8:c".into()))
+        );
+        // Extension-less paths reach the dash tier through its negative stop
+        // rather than the extension rule, and must keep resolving.
+        assert_eq!(
+            parse_line("CHANGELOG-12-a:99:b"),
+            Some(("CHANGELOG".into(), 12, "a:99:b".into()))
+        );
+        // A body reference that looks like a *filename* is the canonical form
+        // the hand-off used to miss. `app.py-476-foo.rs:12:ref` is a context
+        // row for `app.py` line 476 whose body is `foo.rs:12:ref`. The dash
+        // tier confirms the boundary (the segment carries an extension), so the
+        // extension dot inside the body must not veto it — before the fix the
+        // colon tier reclaimed the row as path `app.py-476-foo.rs`, line 12.
+        assert_eq!(
+            parse_line("app.py-476-foo.rs:12:ref"),
+            Some(("app.py".into(), 476, "foo.rs:12:ref".into()))
+        );
+        // Same shape behind a directory, and with a Windows separator in the
+        // body reference.
+        assert_eq!(
+            parse_line("pkg/server.ts-91-lib/index.js:7:import"),
+            Some(("pkg/server.ts".into(), 91, "lib/index.js:7:import".into()))
+        );
+        // The body may even be a bare path with no reference at all.
+        assert_eq!(
+            parse_line("app.py-476-./vendor/other.py"),
+            Some(("app.py".into(), 476, "./vendor/other.py".into()))
+        );
+        // A colon row whose *path* holds the dash triplet is untouched: the
+        // dash tier never confirmed a boundary there, so the colon tier wins.
+        assert_eq!(
+            parse_line("logs/2026-05-03/app.log:12:ERROR"),
+            Some(("logs/2026-05-03/app.log".into(), 12, "ERROR".into()))
+        );
+        assert_eq!(
+            parse_line("migrations/20240101-002-add_users.sql:12:SELECT"),
+            Some((
+                "migrations/20240101-002-add_users.sql".into(),
+                12,
+                "SELECT".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn dash_tier_does_not_run_past_the_path_into_the_body() {
+        // The dash tier keeps the *last* `-<digits>-` marker so that a
+        // dated path (`logs/2026-05-03/…`) isn't split at its first
+        // triplet. But a context-line *body* can be whitespace-free and
+        // carry a triplet of its own — the walk must not follow it there.
+        assert_eq!(
+            parse_line("notes.md-3-see-4-here"),
+            Some(("notes.md".into(), 3, "see-4-here".into()))
+        );
+        assert_eq!(
+            parse_line("CHANGELOG.md-7-v1-2-beta"),
+            Some(("CHANGELOG.md".into(), 7, "v1-2-beta".into()))
+        );
+    }
+
+    #[test]
+    fn parses_context_line_for_extensionless_path() {
+        // Files with no extension are ordinary grep targets, and nothing in
+        // such a line ever gives the walk an extension to stop at. Bounding
+        // the walk on that signal alone splits the path *and* lifts the line
+        // number out of the body — silently. The tier must instead fall back
+        // to the leftmost marker for these.
+        for (line, file, no, body) in [
+            ("CHANGELOG-12-2026-05-03", "CHANGELOG", 12, "2026-05-03"),
+            (
+                "LICENSE-1-Copyright-2026-Acme",
+                "LICENSE",
+                1,
+                "Copyright-2026-Acme",
+            ),
+            ("Makefile-7-build-2-stage", "Makefile", 7, "build-2-stage"),
+            (
+                "Dockerfile-3-FROM-18-alpine",
+                "Dockerfile",
+                3,
+                "FROM-18-alpine",
+            ),
+            ("bin/run-3-exec-9-now", "bin/run", 3, "exec-9-now"),
+            (
+                ".github/workflows/ci-9-2026-01-02",
+                ".github/workflows/ci",
+                9,
+                "2026-01-02",
+            ),
+        ] {
+            assert_eq!(
+                parse_line(line),
+                Some((file.into(), no, body.into())),
+                "extension-less path mis-parsed: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn dated_dir_still_wins_for_an_extensionless_file() {
+        // The case this tier exists for and the case above, on one line: the
+        // walk must cross the dated directory (the rest of the token still
+        // has a `/`) and stop at `Makefile`, which has no extension to
+        // announce itself with.
+        assert_eq!(
+            parse_line("logs/2026-05-03/Makefile-12-all:"),
+            Some(("logs/2026-05-03/Makefile".into(), 12, "all:".into()))
+        );
+    }
+
+    #[test]
+    fn ambiguous_dash_line_falls_back_to_the_leftmost_marker() {
+        // No extension anywhere and a `/` still ahead: the walk never gets
+        // positive evidence either way. It must then return what the
+        // leftmost-wins rule returns rather than guessing — this tier is
+        // never worse than the rule it refines.
+        assert_eq!(
+            parse_line("Makefile-7-include-2-src/foo.mk"),
+            Some(("Makefile".into(), 7, "include-2-src/foo.mk".into()))
+        );
+    }
+
+    #[test]
+    fn a_dotted_version_in_the_body_is_not_an_extension() {
+        // The evidence that "the path continues" must not fire on a dotted
+        // *version* sitting in the body of an extension-less file. The
+        // classic source is `git describe` output — `v1.2.3-4-gdeadbee`
+        // carries both a dot and a `-<digits>-` run, so reading its `.3`
+        // as an extension walks the parse clean out of the path and makes
+        // the marker the `-4-`, inventing the file `Makefile-9-VERSION=v1.2.3`.
+        // An extension needs a letter; `.3` and `.2` are not extensions.
+        for line in [
+            "Makefile-9-VERSION=v1.2.3-4-gdeadbee",
+            "Dockerfile-4-TAG=v2.0.1-3-gabc",
+            "CHANGELOG-2-rel.1.2-3-final",
+            "LICENSE-1-v1.0-2-clause",
+        ] {
+            let (file, _, _) = parse_line(line).expect("parses");
+            assert!(
+                !file.contains('.'),
+                "{line}: dotted version read as a path extension, got file {file:?}"
+            );
+        }
+
+        assert_eq!(
+            parse_line("Makefile-9-VERSION=v1.2.3-4-gdeadbee"),
+            Some(("Makefile".into(), 9, "VERSION=v1.2.3-4-gdeadbee".into()))
+        );
+    }
+
+    #[test]
+    fn a_real_extension_still_counts_even_with_digits_in_it() {
+        // The letter requirement must not cost us genuine extensions that
+        // carry digits (`.mp3`, `.7z`, `.h264`): the walk still has to cross
+        // the dated directory and stop at the file.
+        assert_eq!(
+            parse_line("media/2026-05-03/track-2-final.mp3-8-id3"),
+            Some(("media/2026-05-03/track-2-final.mp3".into(), 8, "id3".into()))
+        );
+    }
+
+    #[test]
+    fn dated_path_inside_a_context_body_is_not_hijacked() {
+        // Same shape as the paths this PR fixes, but on the *body* side of
+        // the marker. Left unbounded, the scan reports a path that never
+        // existed and a line number taken from a date.
+        assert_eq!(
+            parse_line("manifest.txt-5-logs/2026-05-03/app.log"),
+            Some(("manifest.txt".into(), 5, "logs/2026-05-03/app.log".into()))
+        );
+        assert_eq!(
+            parse_line("index.md-2-advisories/CVE-2021-44228.md"),
+            Some(("index.md".into(), 2, "advisories/CVE-2021-44228.md".into()))
         );
     }
 
@@ -721,6 +1196,93 @@ mod tests {
                 42,
                 "fail_fast: true".into()
             ))
+        );
+    }
+
+    #[test]
+    fn date_stamped_path_is_not_misread_as_line_number_marker() {
+        // `logs/2026-05-03/...` contains `-05-`, a `<sep><digits><sep>`
+        // triplet INSIDE the path. Leftmost-wins parsing takes it as the
+        // line-number marker and silently reports a bogus file, a bogus
+        // line number, and a truncated body.
+        assert_eq!(
+            parse_line("logs/2026-05-03/app.log:12:ERROR boom"),
+            Some(("logs/2026-05-03/app.log".into(), 12, "ERROR boom".into()))
+        );
+        // Same for the ripgrep context-line form.
+        assert_eq!(
+            parse_line("logs/2026-11-23/app.log-11-context before"),
+            Some((
+                "logs/2026-11-23/app.log".into(),
+                11,
+                "context before".into()
+            ))
+        );
+        // And for version/ordinal path segments (`v1-2-beta`).
+        assert_eq!(
+            parse_line("src/v1-2-beta/mod.rs:3:fn x() {}"),
+            Some(("src/v1-2-beta/mod.rs".into(), 3, "fn x() {}".into()))
+        );
+        // `NAME-<digits>-<digits>` paths (CVE advisories, timestamped
+        // migrations) hide a triplet in the middle of the path token.
+        assert_eq!(
+            parse_line("advisories/CVE-2021-44228.md:8:Log4Shell"),
+            Some(("advisories/CVE-2021-44228.md".into(), 8, "Log4Shell".into()))
+        );
+        assert_eq!(
+            parse_line("migrations/20240101-002-add_users.sql-9-  id BIGINT"),
+            Some((
+                "migrations/20240101-002-add_users.sql".into(),
+                9,
+                "  id BIGINT".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn date_stamped_paths_are_not_collapsed_into_one_bogus_file() {
+        // The misparse doesn't just corrupt one line — the bogus path
+        // becomes the grouping key, so two unrelated files merge into a
+        // single `logs/2026` bucket and the model sees a path that
+        // doesn't exist. This is what reaches the LLM.
+        let compressor = SearchCompressor::new(SearchCompressorConfig::default());
+        let content = "\
+logs/2026-05-03/app.log:12:ERROR boom
+logs/2026-05-04/app.log:7:ERROR bang";
+        let mut stats = SearchCompressorStats::default();
+        let parsed = compressor.parse_search_results(content, &mut stats);
+
+        assert_eq!(stats.lines_unparsed, 0);
+        let files: Vec<&String> = parsed.keys().collect();
+        assert_eq!(
+            files,
+            vec!["logs/2026-05-03/app.log", "logs/2026-05-04/app.log"]
+        );
+        assert_eq!(parsed["logs/2026-05-03/app.log"].matches[0].line_number, 12);
+        assert_eq!(
+            parsed["logs/2026-05-03/app.log"].matches[0].content,
+            "ERROR boom"
+        );
+    }
+
+    #[test]
+    fn body_line_reference_does_not_hijack_a_context_line() {
+        // A `-`-separated context line whose BODY quotes a `file:line:`
+        // reference must still bind to the context marker, not the
+        // reference. Guards the whitespace-bounded colon tier.
+        assert_eq!(
+            parse_line("src/main.py-44-see foo.rs:12:bar"),
+            Some(("src/main.py".into(), 44, "see foo.rs:12:bar".into()))
+        );
+    }
+
+    #[test]
+    fn digit_terminated_path_still_parses_ripgrep_context_line() {
+        // Rotated logs end in a digit, so the context separator is
+        // digit-preceded — the last-marker rule must still land on it.
+        assert_eq!(
+            parse_line("logs/app.log.1-42-rotated line"),
+            Some(("logs/app.log.1".into(), 42, "rotated line".into()))
         );
     }
 
@@ -799,8 +1361,8 @@ src/main.py-44-context line";
 
     #[test]
     fn select_respects_per_file_cap_and_global_cap() {
-        // Note: compute_optimal_k enforces a hard `min_k=5` floor (matches
-        // Python `_select_matches`), so `max_total_matches` is a soft cap
+        // Note: compute_optimal_k enforces a hard `min_k=5` floor, so
+        // `max_total_matches` is a soft cap
         // that bites only above that floor. Configure 6 here to exercise
         // the cap path.
         let compressor = SearchCompressor::new(SearchCompressorConfig {

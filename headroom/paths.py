@@ -47,8 +47,10 @@ HEADROOM_WORKSPACE_DIR_ENV = "HEADROOM_WORKSPACE_DIR"
 # ---------------------------------------------------------------------------
 
 HEADROOM_SAVINGS_PATH_ENV = "HEADROOM_SAVINGS_PATH"
+HEADROOM_SAVINGS_EVENTS_PATH_ENV = "HEADROOM_SAVINGS_EVENTS_PATH"
 HEADROOM_TOIN_PATH_ENV = "HEADROOM_TOIN_PATH"
 HEADROOM_SUBSCRIPTION_STATE_PATH_ENV = "HEADROOM_SUBSCRIPTION_STATE_PATH"
+HEADROOM_SETTINGS_PATH_ENV = "HEADROOM_SETTINGS_PATH"
 
 # ---------------------------------------------------------------------------
 # Default sub-path fragments
@@ -59,6 +61,7 @@ _CONFIG_DIR_DEFAULT_SUFFIX = "config"
 
 # Resource file/sub-dir names (kept here so nothing else has to hardcode them)
 _SAVINGS_FILE = "proxy_savings.json"
+_SETTINGS_FILE = "settings.json"
 _TOIN_FILE = "toin.json"
 _MODELS_FILE = "models.json"
 _SUBSCRIPTION_FILE = "subscription_state.json"
@@ -66,18 +69,18 @@ _MEMORY_DB_FILE = "memory.db"
 _MEMORIES_DIR = "memories"
 _LICENSE_CACHE_FILE = "license_cache.json"
 _SESSION_STATS_FILE = "session_stats.jsonl"
+_SAVINGS_EVENTS_FILE = "savings_events.jsonl"
 _SYNC_STATE_FILE = "sync_state.json"
 _BRIDGE_STATE_FILE = "bridge_state.json"
 _LOGS_DIR = "logs"
+# Legacy shared runtime-log filename. Kept only as the readers' backward-compat
+# fallback; live proxies now write per-port files (see ``proxy_log_path``).
 _PROXY_LOG_FILE = "proxy.log"
+_PROXY_STDIO_LOG_FILE = "proxy-stdio.log"
 _DEBUG_400_DIR = "debug_400"
 _CODEX_WIRE_DEBUG_DIR = "codex_wire"
 _BIN_DIR = "bin"
 _PROXY_CLIENTS_DIR = "clients"
-_RTK_UNIX = "rtk"
-_RTK_WIN = "rtk.exe"
-_LEAN_CTX_UNIX = "lean-ctx"
-_LEAN_CTX_WIN = "lean-ctx.exe"
 _DEPLOY_DIR = "deploy"
 _PLUGINS_DIR = "plugins"
 
@@ -91,6 +94,75 @@ def _env(name: str) -> str:
     """Return a trimmed environment value, or ``""`` when unset/blank."""
 
     return os.environ.get(name, "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Process-wide stateless flag
+# ---------------------------------------------------------------------------
+# Stateless mode forbids writes to the workspace. Many persisters are
+# module-level singletons reached without a config object, so the proxy records
+# the mode here once at startup and writers consult ``process_is_stateless()``.
+
+_PROCESS_STATELESS: bool = False
+
+
+def set_process_stateless(value: bool) -> None:
+    """Record process-wide stateless mode (set once at proxy startup)."""
+
+    global _PROCESS_STATELESS
+    _PROCESS_STATELESS = bool(value)
+
+
+def process_is_stateless() -> bool:
+    """True when the process must not write to the workspace.
+
+    True if ``set_process_stateless(True)`` was called OR the ``HEADROOM_STATELESS``
+    environment variable is set, so non-proxy entrypoints honor it too.
+    """
+
+    if _PROCESS_STATELESS:
+        return True
+    return _env("HEADROOM_STATELESS").lower() in ("1", "true", "yes", "on")
+
+
+# Purposes for which a "skipped because stateless" notice has already been
+# logged, so a busy proxy says it once per persister, not once per turn.
+_PERSISTENCE_NOTICED: set[str] = set()
+
+
+def persistence_allowed(purpose: str) -> bool:
+    """Whether a runtime persister may write *purpose* to the workspace now.
+
+    This is the one predicate every on-disk store consults before it creates or
+    writes a file under the workspace: the CCR retrieval store, the licence
+    cache, MCP session stats, the savings ledger, subscription state, memory
+    sync state, the update-check cache. Returns ``False`` in stateless mode
+    (``--stateless`` or ``HEADROOM_STATELESS``), in which case the caller keeps
+    its in-memory state and skips the write. The first refusal for each
+    *purpose* is logged at INFO so an operator can see what stateless mode
+    turned off; later refusals are silent.
+
+    Use this rather than checking :func:`process_is_stateless` inline so the
+    stateless guarantee ("writes nothing to the workspace") is enforced in one
+    place and its coverage can be read off the call sites.
+    """
+
+    if not process_is_stateless():
+        return True
+    if purpose not in _PERSISTENCE_NOTICED:
+        _PERSISTENCE_NOTICED.add(purpose)
+        import logging
+
+        logging.getLogger(__name__).info(
+            "Stateless mode: not persisting %s to disk (kept in memory only).", purpose
+        )
+    return False
+
+
+def _reset_persistence_notices() -> None:
+    """Forget which stateless notices were logged. For tests."""
+
+    _PERSISTENCE_NOTICED.clear()
 
 
 def _resolve(explicit: str | os.PathLike[str] | None, env_var: str, derived: Path) -> Path:
@@ -179,6 +251,16 @@ def savings_path(explicit: str | os.PathLike[str] | None = None) -> Path:
     )
 
 
+def settings_path(explicit: str | os.PathLike[str] | None = None) -> Path:
+    """Return the path for the dashboard-managed settings JSON file."""
+
+    return _resolve(
+        explicit,
+        HEADROOM_SETTINGS_PATH_ENV,
+        workspace_dir() / _SETTINGS_FILE,
+    )
+
+
 def toin_path(explicit: str | os.PathLike[str] | None = None) -> Path:
     """Return the path for the TOIN telemetry JSON file.
 
@@ -228,6 +310,21 @@ def session_stats_path() -> Path:
     return workspace_dir() / _SESSION_STATS_FILE
 
 
+def savings_events_path(explicit: str | os.PathLike[str] | None = None) -> Path:
+    """Return the path for the durable append-only savings event ledger.
+
+    Unlike :func:`session_stats_path` (pruned to a short rolling window), this
+    file accrues one line per compression across proxy restarts and concurrent
+    MCP processes, and is the source of truth for ``headroom savings``.
+    """
+
+    return _resolve(
+        explicit,
+        HEADROOM_SAVINGS_EVENTS_PATH_ENV,
+        workspace_dir() / _SAVINGS_EVENTS_FILE,
+    )
+
+
 def sync_state_path() -> Path:
     """Return the path for memory sync state."""
 
@@ -246,10 +343,33 @@ def log_dir() -> Path:
     return workspace_dir() / _LOGS_DIR
 
 
-def proxy_log_path() -> Path:
-    """Return the path for the proxy log file."""
+def proxy_log_path(port: int | None = None, *, process_id: int | None = None) -> Path:
+    """Return the path for the proxy runtime log file.
 
-    return log_dir() / _PROXY_LOG_FILE
+    Multi-worker processes pass both values and write
+    ``proxy-<port>-<pid>.log``. Omitting *process_id* returns the standard
+    per-port name; omitting *port* returns the legacy shared name. Readers
+    honor all three.
+    """
+
+    if port is None:
+        name = _PROXY_LOG_FILE
+    elif process_id is None:
+        name = f"proxy-{port}.log"
+    else:
+        name = f"proxy-{port}-{process_id}.log"
+    return log_dir() / name
+
+
+def proxy_stdio_log_path(port: int | None = None) -> Path:
+    """Return the path for the proxy stdout/stderr capture file.
+
+    Per-port for the same reason as :func:`proxy_log_path`; the legacy
+    ``proxy-stdio.log`` name is used when *port* is omitted.
+    """
+
+    name = f"proxy-stdio-{port}.log" if port is not None else _PROXY_STDIO_LOG_FILE
+    return log_dir() / name
 
 
 def debug_400_dir() -> Path:
@@ -276,20 +396,6 @@ def proxy_clients_dir(port: int) -> Path:
     return workspace_dir() / _PROXY_CLIENTS_DIR / str(port)
 
 
-def rtk_path() -> Path:
-    """Return the path to the vendored ``rtk`` binary."""
-
-    name = _RTK_WIN if os.name == "nt" else _RTK_UNIX
-    return bin_dir() / name
-
-
-def lean_ctx_path() -> Path:
-    """Return the path to the vendored ``lean-ctx`` binary."""
-
-    name = _LEAN_CTX_WIN if os.name == "nt" else _LEAN_CTX_UNIX
-    return bin_dir() / name
-
-
 def deploy_root() -> Path:
     """Return the root directory for persistent deployment profiles."""
 
@@ -300,6 +406,12 @@ def beacon_lock_path(port: int) -> Path:
     """Return the per-port proxy beacon lock file path."""
 
     return workspace_dir() / f".beacon_lock_{int(port)}"
+
+
+def proxy_start_lock_path(port: int) -> Path:
+    """Return the per-port lock used to serialize wrap proxy startup."""
+
+    return workspace_dir() / f".proxy_start_{int(port)}.lock"
 
 
 # ---------------------------------------------------------------------------
@@ -324,19 +436,38 @@ def models_config_path() -> Path:
 # ---------------------------------------------------------------------------
 
 
+def _validate_plugin_name(plugin_name: str) -> None:
+    """Reject plugin names that would escape the ``plugins/`` sandbox.
+
+    Path separators (``/``, ``\\``) are rejected so a name cannot address a
+    subdirectory. ``.`` and ``..`` are rejected because ``plugins / ".."``
+    resolves to the plugins-parent (i.e. the whole config/workspace root),
+    handing a plugin read/write access to every other plugin's state and the
+    workspace's savings ledger, memory DB, license cache, and logs. NUL is
+    rejected because it terminates paths on POSIX APIs.
+    """
+
+    if (
+        not plugin_name
+        or plugin_name in {".", ".."}
+        or "/" in plugin_name
+        or "\\" in plugin_name
+        or "\x00" in plugin_name
+    ):
+        raise ValueError(f"invalid plugin name: {plugin_name!r}")
+
+
 def plugin_config_dir(plugin_name: str) -> Path:
     """Return the config directory for a named plugin."""
 
-    if not plugin_name or "/" in plugin_name or "\\" in plugin_name:
-        raise ValueError(f"invalid plugin name: {plugin_name!r}")
+    _validate_plugin_name(plugin_name)
     return config_dir() / _PLUGINS_DIR / plugin_name
 
 
 def plugin_workspace_dir(plugin_name: str) -> Path:
     """Return the workspace directory for a named plugin."""
 
-    if not plugin_name or "/" in plugin_name or "\\" in plugin_name:
-        raise ValueError(f"invalid plugin name: {plugin_name!r}")
+    _validate_plugin_name(plugin_name)
     return workspace_dir() / _PLUGINS_DIR / plugin_name
 
 
@@ -344,8 +475,13 @@ __all__ = [
     "HEADROOM_CONFIG_DIR_ENV",
     "HEADROOM_WORKSPACE_DIR_ENV",
     "HEADROOM_SAVINGS_PATH_ENV",
+    "HEADROOM_SAVINGS_EVENTS_PATH_ENV",
     "HEADROOM_TOIN_PATH_ENV",
     "HEADROOM_SUBSCRIPTION_STATE_PATH_ENV",
+    "HEADROOM_SETTINGS_PATH_ENV",
+    "set_process_stateless",
+    "process_is_stateless",
+    "persistence_allowed",
     "config_dir",
     "workspace_dir",
     "ensure_config_dir",
@@ -357,18 +493,20 @@ __all__ = [
     "native_memory_dir",
     "license_cache_path",
     "session_stats_path",
+    "savings_events_path",
+    "settings_path",
     "sync_state_path",
     "bridge_state_path",
     "log_dir",
     "proxy_log_path",
+    "proxy_stdio_log_path",
     "debug_400_dir",
     "codex_wire_debug_dir",
     "bin_dir",
     "proxy_clients_dir",
-    "rtk_path",
-    "lean_ctx_path",
     "deploy_root",
     "beacon_lock_path",
+    "proxy_start_lock_path",
     "models_config_path",
     "plugin_config_dir",
     "plugin_workspace_dir",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import warnings
 from importlib import import_module
 from typing import TYPE_CHECKING
 
@@ -61,6 +62,11 @@ if TYPE_CHECKING:
         SearchCompressorConfig,
     )
     from headroom.transforms.smart_crusher import SmartCrusher, SmartCrusherConfig  # noqa: F401
+    from headroom.transforms.tabular_ingest import (  # noqa: F401
+        TabularCompressionResult,
+        TabularCompressor,
+        TabularCompressorConfig,
+    )
 
 _HTML_EXTRACTOR_AVAILABLE = importlib.util.find_spec("trafilatura") is not None
 
@@ -88,6 +94,9 @@ __all__ = [
     "LogCompressor",
     "LogCompressorConfig",
     "LogCompressionResult",
+    "TabularCompressor",
+    "TabularCompressorConfig",
+    "TabularCompressionResult",
     "DiffCompressor",
     "DiffCompressorConfig",
     "DiffCompressionResult",
@@ -154,6 +163,15 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "LogCompressor": ("headroom.transforms.log_compressor", "LogCompressor"),
     "LogCompressorConfig": ("headroom.transforms.log_compressor", "LogCompressorConfig"),
     "LogCompressionResult": ("headroom.transforms.log_compressor", "LogCompressionResult"),
+    "TabularCompressor": ("headroom.transforms.tabular_ingest", "TabularCompressor"),
+    "TabularCompressorConfig": (
+        "headroom.transforms.tabular_ingest",
+        "TabularCompressorConfig",
+    ),
+    "TabularCompressionResult": (
+        "headroom.transforms.tabular_ingest",
+        "TabularCompressionResult",
+    ),
     "DiffCompressor": ("headroom.transforms.diff_compressor", "DiffCompressor"),
     "DiffCompressorConfig": ("headroom.transforms.diff_compressor", "DiffCompressorConfig"),
     "DiffCompressionResult": (
@@ -192,6 +210,10 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
 }
 
 
+# Lazy exports that are deprecated: accessing them warns at the caller.
+_DEPRECATED_MODULES = frozenset({"headroom.transforms.anchor_selector"})
+
+
 def __getattr__(name: str) -> object:
     if name == "__path__":
         raise AttributeError(name)
@@ -202,6 +224,23 @@ def __getattr__(name: str) -> object:
         module_name, attr_name = _LAZY_EXPORTS[name]
     except KeyError as exc:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+
+    if module_name in _DEPRECATED_MODULES:
+        warnings.warn(
+            f"headroom.transforms.{name} is deprecated and will be removed in a future "
+            "release; it has no replacement (SmartCrusher's anchor selection runs in Rust).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        # Warn once, here, rather than again from the module's own import-time warning.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            module = import_module(module_name)
+        value = getattr(module, attr_name)
+        # Cache it, so `from headroom.transforms import X` (which looks the
+        # name up twice) warns once, and later accesses stay quiet.
+        globals()[name] = value
+        return value
 
     module = import_module(module_name)
     value = getattr(module, attr_name)

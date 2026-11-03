@@ -7,17 +7,50 @@ from pathlib import Path
 
 import click
 
+from headroom.offline import pin_litellm_cost_map_local
+
 from .main import main
+
+
+def _parse_categories(categories: str | None) -> list[int] | None:
+    """Parse a comma-separated ``--categories`` value into validated ints.
+
+    Raises ``click.BadParameter`` (clean usage error, exit 2) instead of
+    letting a non-numeric or out-of-range token surface as a raw traceback.
+    """
+    if not categories:
+        return None
+    parsed: list[int] = []
+    for token in categories.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            value = int(token)
+        except ValueError:
+            raise click.BadParameter(
+                f"{token!r} is not an integer; expected comma-separated values 1-5, e.g. 1,2,3",
+                param_hint="--categories",
+            ) from None
+        if not 1 <= value <= 5:
+            raise click.BadParameter(
+                f"{value} is out of range; categories must be 1-5",
+                param_hint="--categories",
+            )
+        parsed.append(value)
+    return parsed or None
 
 
 @main.group()
 def evals() -> None:
-    """Memory evaluation commands.
+    """Evaluation commands (memory, compression robustness, retention).
 
     \b
     Examples:
         headroom evals memory       Run LoCoMo memory evaluation
         headroom evals memory-v2    Run V2 evaluation with LLM-controlled tools
+        headroom evals adversarial  Compression-robustness adversarial grid
+        headroom evals probes       Retention probes over recorded sessions
     """
     pass
 
@@ -418,16 +451,14 @@ def _run_memory_eval(
         from headroom.memory import MemoryConfig
     except ImportError as e:
         click.echo("Error: Memory eval dependencies not installed.")
-        click.echo("Run: pip install headroom[memory,evals]")
+        click.echo('Run: pip install "headroom-ai[memory,evals]"')
         click.echo(f"Details: {e}")
         raise SystemExit(1) from None
 
     import asyncio
 
     # Build configuration
-    parsed_categories = None
-    if categories:
-        parsed_categories = [int(c) for c in categories.split(",")]
+    parsed_categories = _parse_categories(categories)
 
     memory_config = MemoryConfig()
 
@@ -451,6 +482,7 @@ def _run_memory_eval(
     answer_fn = None
     if answer_model:
         try:
+            pin_litellm_cost_map_local()
             import litellm
 
             def answer_fn(question: str, memories: list[str]) -> str:
@@ -592,16 +624,14 @@ def _run_memory_eval_v2(
         )
     except ImportError as e:
         click.echo("Error: Memory eval V2 dependencies not installed.")
-        click.echo("Run: pip install headroom[memory,evals]")
+        click.echo('Run: pip install "headroom-ai[memory,evals]"')
         click.echo(f"Details: {e}")
         raise SystemExit(1) from None
 
     import asyncio
 
     # Build configuration
-    parsed_categories = None
-    if categories:
-        parsed_categories = [int(c) for c in categories.split(",")]
+    parsed_categories = _parse_categories(categories)
 
     eval_config = MemoryEvalConfigV2(
         n_conversations=n_conversations,

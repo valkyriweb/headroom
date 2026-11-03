@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import time
+import warnings
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -200,6 +201,17 @@ class EvalSuite:
         self.cases: list[EvalCase] = cases or []
 
     def add_case(self, case: EvalCase) -> None:
+        """Append a case to the suite.
+
+        .. deprecated:: 0.41.0
+            Pass ``cases`` to the constructor, or append to ``suite.cases``.
+        """
+        warnings.warn(
+            "EvalSuite.add_case is deprecated and will be removed in a future release; "
+            "pass cases to EvalSuite(...) or append to suite.cases.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.cases.append(case)
 
     def __len__(self) -> int:
@@ -260,8 +272,10 @@ class CompressionEvaluator:
         return f"Based on the context, {' '.join(words[:20])}..."
 
     def _estimate_tokens(self, text: str) -> int:
-        """Estimate token count (roughly 4 chars per token)."""
-        return len(text) // 4
+        """Estimate token count: ~1.5 tokens per CJK char (CJK is dense, ~1-2
+        tokens/char), ~4 chars per token otherwise."""
+        cjk = sum(1 for c in text if "　" <= c <= "鿿" or "가" <= c <= "힯")
+        return int(cjk * 1.5) + (len(text) - cjk) // 4
 
     def evaluate_case(
         self,
@@ -369,7 +383,17 @@ class CompressionEvaluator:
 
         Returns:
             Aggregated results with statistics
+
+        .. deprecated:: 0.41.0
+            Call ``evaluate_case`` per case, or use a runner from
+            ``headroom.evals.runners``.
         """
+        warnings.warn(
+            "CompressionEvaluator.evaluate_suite is deprecated and will be removed in a future "
+            "release; call evaluate_case per case or use a runner from headroom.evals.runners.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         start_time = time.time()
         results: list[EvalResult] = []
 

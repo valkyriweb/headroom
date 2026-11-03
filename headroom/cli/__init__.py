@@ -18,12 +18,16 @@ from . import (  # noqa: F401
     copilot_auth,
     evals,
     init,
+    inspect,
     install,
     learn,
     mcp,
     perf,
     proxy,
+    recover,
+    rollout,
     tools,
+    update,
     wrap,
 )
 from .main import main

@@ -26,6 +26,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from headroom.cache.backends.memory import InMemoryBackend
+from headroom.cache.backends.sqlite import SQLiteBackend
 from headroom.cache.compression_store import (
     CCR_TTL_SECONDS_ENV,
     DEFAULT_CCR_TTL_SECONDS,
@@ -60,7 +62,8 @@ def _capture_headroom_retrieve_events():
         logger.setLevel(previous_level)
 
 
-def test_retrieve_logs_payload_preview():
+def test_retrieve_logs_payload_preview(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("HEADROOM_LOG_PAYLOAD_PREVIEW", "1")
     store = CompressionStore(enable_feedback=False)
     hash_key = store.store(
         original="secret-ish payload for operator debugging",
@@ -85,7 +88,8 @@ def test_retrieve_logs_payload_preview():
     assert events[0]["tool_name"] == "tool_a"
 
 
-def test_retrieve_log_redacts_secret_payload_values():
+def test_retrieve_log_redacts_secret_payload_values(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("HEADROOM_LOG_PAYLOAD_PREVIEW", "1")
     store = CompressionStore(enable_feedback=False)
     hash_key = store.store(
         original="OPENAI_API_KEY=sk-proj-secret1234567890 Authorization: Bearer token123456789",
@@ -101,33 +105,6 @@ def test_retrieve_log_redacts_secret_payload_values():
     assert "Bearer token123456789" not in events[0]["payload_preview"]
     assert "OPENAI_API_KEY=[REDACTED]" in events[0]["payload_preview"]
     assert "Authorization: [REDACTED]" in events[0]["payload_preview"]
-
-
-def test_search_logs_retrieved_payload_preview():
-    store = CompressionStore(enable_feedback=False)
-    items = [
-        {"id": 1, "text": "alpha target"},
-        {"id": 2, "text": "beta other"},
-    ]
-    hash_key = store.store(
-        original=json.dumps(items),
-        compressed="[]",
-        original_item_count=2,
-        compressed_item_count=0,
-        tool_name="search_tool",
-    )
-
-    with _capture_headroom_retrieve_events() as events:
-        results = store.search(hash_key, "alpha", score_threshold=0.0)
-
-    assert results
-    assert len(events) == 1
-    assert events[0]["hash"] == hash_key
-    assert events[0]["retrieval_type"] == "search"
-    assert events[0]["query"] == "alpha"
-    assert events[0]["payload_preview"] == json.dumps(results, ensure_ascii=False)
-    assert events[0]["payload_preview_chars"] == len(json.dumps(results, ensure_ascii=False))
-    assert events[0]["payload_truncated"] is False
 
 
 def test_global_store_uses_env_default_ttl(monkeypatch: pytest.MonkeyPatch):
@@ -653,18 +630,6 @@ class TestCompressionStoreTTL:
 
         assert store_with_short_ttl.get_metadata(hash_key) is None
 
-    def test_search_returns_empty_for_expired(self, store_with_short_ttl: CompressionStore):
-        """search returns empty list for expired entries."""
-        hash_key = store_with_short_ttl.store(
-            original=json.dumps([{"id": 1, "name": "test"}]),
-            compressed="[]",
-        )
-
-        time.sleep(1.1)
-
-        results = store_with_short_ttl.search(hash_key, "test")
-        assert results == []
-
     def test_exists_clean_expired_false_does_not_delete(
         self, store_with_short_ttl: CompressionStore
     ):
@@ -698,6 +663,126 @@ class TestCompressionStoreTTL:
 
 class TestCompressionStoreEviction:
     """Tests for CompressionStore memory limits and eviction."""
+
+    def test_new_key_store_does_not_scan_backend_for_expiry(self):
+        """New-key store() must not trigger a backend items() expiry scan."""
+
+        class _ItemsCountingBackend(InMemoryBackend):
+            def __init__(self) -> None:
+                super().__init__()
+                self.items_calls = 0
+
+            def items(self) -> list[tuple[str, CompressionEntry]]:
+                self.items_calls += 1
+                return super().items()
+
+        backend = _ItemsCountingBackend()
+        store = CompressionStore(max_entries=2, backend=backend)
+
+        for i in range(3):
+            store.store(original=f"content_{i}", compressed=f"compressed_{i}")
+
+        assert backend.items_calls == 0
+
+    def test_expired_cleanup_below_capacity_is_bounded(self):
+        """A new key cleans at most one expired entry while capacity is available."""
+        backend = InMemoryBackend()
+        store = CompressionStore(max_entries=10, enable_feedback=False, backend=backend)
+
+        with (
+            patch("headroom.cache.compression_store.time.time") as now,
+            patch.object(backend, "get", wraps=backend.get) as get,
+            patch.object(backend, "delete", wraps=backend.delete) as delete,
+            patch.object(backend, "items", wraps=backend.items) as items,
+            patch.object(backend, "count", wraps=backend.count) as count,
+        ):
+            operations = (get, delete, items, count)
+            now.return_value = 100
+            for i in range(4):
+                store.store(original=f"expired_{i}", compressed="expired", ttl=1)
+
+            for operation in operations:
+                operation.reset_mock()
+            now.return_value = 200
+            store.store(original="new_1", compressed="new", ttl=100)
+            assert tuple(operation.call_count for operation in operations) == (2, 1, 0, 1)
+
+            for operation in operations:
+                operation.reset_mock()
+            now.return_value = 201
+            store.store(original="new_2", compressed="new", ttl=100)
+            assert (items.call_count, count.call_count) == (0, 1)
+
+    def test_in_memory_oversized_ttl_at_capacity_keeps_indexes_consistent(self):
+        """An oversized positive TTL is stored as a non-expiring heap entry."""
+        backend = InMemoryBackend()
+        store = CompressionStore(max_entries=1, enable_feedback=False, backend=backend)
+
+        with patch("headroom.cache.compression_store.time.time") as now:
+            now.return_value = 100.0
+            old_hash = store.store(original="old", compressed="old")
+            now.return_value = 101.0
+            oversized_hash = store.store(
+                original="oversized",
+                compressed="oversized",
+                ttl=10**1000,
+            )
+
+        entry = backend.get(oversized_hash)
+        assert entry is not None
+        assert not backend.exists(old_hash)
+        assert len(store._eviction_heap) - store._stale_heap_entries == backend.count() == 1
+        assert len(store._expiration_heap) - store._stale_expiration_heap_entries == backend.count()
+        assert (entry.created_at, oversized_hash) in store._eviction_heap
+        assert (float("inf"), entry.created_at, oversized_hash) in store._expiration_heap
+
+    @pytest.mark.parametrize("mode", ["count", "revision", "revision_error", "stale_revision"])
+    def test_shared_sqlite_pressure_reconciles_sibling_entries(self, tmp_path, mode: str):
+        """Capacity reconciliation covers sibling count and identity changes."""
+
+        class _RevisionFailureSQLiteBackend(SQLiteBackend):
+            fail_revision = False
+
+            def external_revision(self) -> int | None:
+                if self.fail_revision:
+                    raise RuntimeError("revision unavailable")
+                return super().external_revision()
+
+        db_path = tmp_path / "ccr.db"
+        backend = _RevisionFailureSQLiteBackend(db_path)
+        sibling_backend = SQLiteBackend(db_path)
+        store = CompressionStore(max_entries=2, enable_feedback=True, backend=backend)
+        sibling_store = CompressionStore(enable_feedback=False, backend=sibling_backend)
+
+        with patch("headroom.cache.compression_store.time.time") as now:
+            now.return_value = 90
+            removed_hash = None
+            if mode != "count":
+                removed_hash = store.store(
+                    original="removed",
+                    compressed="removed",
+                    ttl=1 if mode == "stale_revision" else 100,
+                )
+            now.return_value = 100
+            live_hash = store.store(
+                original="live",
+                compressed="live",
+                ttl=100,
+                tool_signature_hash="live_signature",
+                compression_strategy="top_k",
+            )
+            if removed_hash is not None and mode != "stale_revision":
+                sibling_backend.delete(removed_hash)
+            now.return_value = 110
+            sibling_store.store(original="expired", compressed="expired", ttl=5)
+            backend.fail_revision = mode == "revision_error"
+            now.return_value = 116
+            with patch.object(backend, "items", wraps=backend.items) as items:
+                new_hash = store.store(original="new", compressed="new", ttl=100)
+
+        assert set(backend.keys()) == {live_hash, new_hash}
+        assert items.call_count == 1
+        assert store._pending_feedback_events == []
 
     def test_eviction_at_capacity(self, store_with_small_capacity: CompressionStore):
         """Oldest entries are evicted when at capacity."""
@@ -745,27 +830,155 @@ class TestCompressionStoreEviction:
         assert store_with_small_capacity.exists(hashes[2])
         assert store_with_small_capacity.exists(new_hash)
 
+    def test_mixed_ttl_pressure_evicts_oldest_created_live_entry(self):
+        """Live eviction remains creation-ordered across mixed TTLs."""
+        backend = InMemoryBackend()
+        store = CompressionStore(max_entries=2, enable_feedback=False, backend=backend)
+
+        with patch("headroom.cache.compression_store.time.time") as now:
+            now.return_value = 100
+            older_long_ttl = store.store(original="older", compressed="older", ttl=100)
+            now.return_value = 110
+            newer_short_ttl = store.store(original="newer", compressed="newer", ttl=20)
+            now.return_value = 120
+            new_hash = store.store(original="new", compressed="new", ttl=100)
+
+        assert not backend.exists(older_long_ttl)
+        assert backend.exists(newer_short_ttl)
+        assert backend.exists(new_hash)
+        assert backend.count() == 2
+
+    def test_duplicate_store_at_capacity_does_not_evict(
+        self, store_with_small_capacity: CompressionStore
+    ):
+        """Re-storing an already-present hash at capacity overwrites in place and
+        must NOT evict an unrelated live entry (which would drop below capacity
+        and make that entry's marker unredeemable). The CCR mirror bridge
+        re-stores the same hash on later turns, so this is a common path."""
+        hashes = []
+        for i in range(3):
+            hashes.append(
+                store_with_small_capacity.store(
+                    original=f"content_{i}", compressed=f"compressed_{i}"
+                )
+            )
+            time.sleep(0.01)
+        assert store_with_small_capacity.get_stats()["entry_count"] == 3
+
+        # Re-store the SAME content for the oldest entry (a duplicate -> same hash).
+        dup = store_with_small_capacity.store(original="content_0", compressed="compressed_0")
+        assert dup == hashes[0]
+
+        # No eviction happened: all three entries survive and count stays at 3.
+        for h in hashes:
+            assert store_with_small_capacity.exists(h)
+        assert store_with_small_capacity.get_stats()["entry_count"] == 3
+
     def test_eviction_cleans_expired_first(self):
         """Eviction cleans expired entries before evicting valid ones."""
-        store = CompressionStore(max_entries=3, default_ttl=1)
+        backend = InMemoryBackend()
+        store = CompressionStore(max_entries=2, enable_feedback=True, backend=backend)
 
-        # Add 2 entries that will expire
-        hash1 = store.store(original="content_1", compressed="c1", ttl=1)
-        hash2 = store.store(original="content_2", compressed="c2", ttl=1)
+        with patch("headroom.cache.compression_store.time.time") as now:
+            now.return_value = 100
+            live_hash = store.store(original="live", compressed="live", ttl=100)
+            now.return_value = 110
+            expired_hash = store.store(
+                original="expired",
+                compressed="expired",
+                ttl=5,
+                tool_signature_hash="expired_signature",
+                compression_strategy="top_k",
+            )
+            now.return_value = 116
+            new_hash = store.store(original="new", compressed="new", ttl=100)
 
-        time.sleep(1.1)  # Wait for expiration
+        assert backend.exists(live_hash)
+        assert not backend.exists(expired_hash)
+        assert backend.exists(new_hash)
+        assert backend.count() == 2
+        assert store._pending_feedback_events == []
 
-        # Add 2 more entries (should clean expired first, not evict new)
-        hash3 = store.store(original="content_3", compressed="c3", ttl=300)
-        hash4 = store.store(original="content_4", compressed="c4", ttl=300)
+    @pytest.mark.parametrize("misses", [1, 2])
+    def test_expiration_cleanup_handles_transient_backend_misses(self, misses: int):
+        """Expiry lookup misses retry once, then fail open without live eviction."""
 
-        # Expired entries should be gone
-        assert not store.exists(hash1)
-        assert not store.exists(hash2)
+        class _TransientMissBackend(InMemoryBackend):
+            miss_key: str | None = None
+            misses_remaining = 0
 
-        # New entries should exist
-        assert store.exists(hash3)
-        assert store.exists(hash4)
+            def get(self, hash_key: str) -> CompressionEntry | None:
+                if hash_key == self.miss_key and self.misses_remaining:
+                    self.misses_remaining -= 1
+                    return None
+                return super().get(hash_key)
+
+        backend = _TransientMissBackend()
+        store = CompressionStore(max_entries=2, enable_feedback=True, backend=backend)
+
+        with patch("headroom.cache.compression_store.time.time") as now:
+            if misses == 1:
+                now.return_value = 80
+                store.store(original="stale", compressed="stale", ttl=100)
+            now.return_value = 90
+            live_hash = store.store(
+                original="live",
+                compressed="live",
+                ttl=100,
+                tool_signature_hash="live_signature",
+                compression_strategy="top_k",
+            )
+            now.return_value = 91
+            expired_hash = store.store(original="expired", compressed="expired", ttl=5)
+            backend.miss_key = expired_hash
+            backend.misses_remaining = misses
+            now.return_value = 97
+            new_hash = store.store(original="new", compressed="new", ttl=100)
+
+        expected_keys = {live_hash, new_hash}
+        if misses == 2:
+            expected_keys.add(expired_hash)
+        assert set(backend.keys()) == expected_keys
+        assert store._pending_feedback_events == []
+
+    def test_eviction_ignores_stale_expiration_after_replacement(self):
+        """A replaced entry survives its old expiration heap tuple."""
+        backend = InMemoryBackend()
+        store = CompressionStore(max_entries=2, enable_feedback=False, backend=backend)
+
+        with patch("headroom.cache.compression_store.time.time") as now:
+            now.return_value = 90
+            oldest_hash = store.store(original="oldest", compressed="oldest", ttl=100)
+            now.return_value = 100
+            replacement_hash = store.store(original="replacement", compressed="v1", ttl=5)
+            now.return_value = 101
+            store.store(original="replacement", compressed="v2", ttl=100)
+            now.return_value = 110
+            new_hash = store.store(original="new", compressed="new", ttl=100)
+
+        assert not backend.exists(oldest_hash)
+        assert backend.exists(replacement_hash)
+        assert backend.exists(new_hash)
+
+    def test_eviction_ignores_stale_indexes_after_read_cleanup(self):
+        """Read-side expiry cleanup leaves both eviction indexes consistent."""
+        backend = InMemoryBackend()
+        store = CompressionStore(max_entries=2, enable_feedback=False, backend=backend)
+
+        with patch("headroom.cache.compression_store.time.time") as now:
+            now.return_value = 100
+            expired_hash = store.store(original="expired", compressed="expired", ttl=1)
+            now.return_value = 102
+            assert store.retrieve(expired_hash) is None
+            first_live = store.store(original="first", compressed="first", ttl=100)
+            now.return_value = 103
+            second_live = store.store(original="second", compressed="second", ttl=100)
+            now.return_value = 104
+            new_hash = store.store(original="new", compressed="new", ttl=100)
+
+        assert not backend.exists(first_live)
+        assert backend.exists(second_live)
+        assert backend.exists(new_hash)
 
     def test_heap_rebuild_on_stale_threshold(self):
         """Heap is rebuilt when stale entry ratio exceeds threshold."""
@@ -779,8 +992,10 @@ class TestCompressionStoreEviction:
         for i in range(5):
             store.store(original=f"content_{i}", compressed=f"updated_{i}")
 
-        # Stale ratio should be tracked
-        # The heap rebuild happens automatically when threshold is exceeded
+        assert len(store._eviction_heap) == 5
+        assert len(store._expiration_heap) == 5
+        assert store._stale_heap_entries == 0
+        assert store._stale_expiration_heap_entries == 0
 
 
 # =============================================================================
@@ -894,122 +1109,6 @@ class TestCompressionStoreMetadata:
 # =============================================================================
 
 
-class TestCompressionStoreSearch:
-    """Tests for CompressionStore search functionality."""
-
-    def test_search_with_bm25_returns_matches(self, store: CompressionStore):
-        """search() uses BM25 to find matching items."""
-        items = [
-            {"id": 1, "content": "Python programming language"},
-            {"id": 2, "content": "JavaScript web development"},
-            {"id": 3, "content": "Python data science pandas"},
-            {"id": 4, "content": "Java enterprise applications"},
-            {"id": 5, "content": "Python machine learning tensorflow"},
-        ]
-
-        hash_key = store.store(
-            original=json.dumps(items),
-            compressed=json.dumps(items[:2]),
-        )
-
-        results = store.search(hash_key, "Python programming")
-
-        assert len(results) >= 1
-        result_ids = [r["id"] for r in results]
-        assert 1 in result_ids  # "Python programming language" should match
-
-    def test_search_respects_max_results(self, store: CompressionStore):
-        """search() respects max_results parameter."""
-        items = [{"id": i, "content": f"item {i}"} for i in range(50)]
-        hash_key = store.store(original=json.dumps(items), compressed="[]")
-
-        results = store.search(hash_key, "item", max_results=5)
-
-        assert len(results) <= 5
-
-    def test_search_respects_score_threshold(self, store: CompressionStore):
-        """search() filters by score threshold."""
-        items = [
-            {"id": 1, "content": "exact match query term"},
-            {"id": 2, "content": "completely unrelated content xyz"},
-        ]
-        hash_key = store.store(original=json.dumps(items), compressed="[]")
-
-        # High threshold should filter low-scoring items
-        results = store.search(hash_key, "exact match query", score_threshold=0.5)
-
-        # Should return the exact match, filter the unrelated
-        if results:
-            assert any("exact match" in str(r) for r in results)
-
-    def test_search_nonexistent_returns_empty(self, store: CompressionStore):
-        """search() returns empty list for nonexistent hash."""
-        results = store.search("nonexistent", "query")
-        assert results == []
-
-    def test_search_invalid_json_returns_empty(self, store: CompressionStore):
-        """search() handles invalid JSON gracefully."""
-        hash_key = store.store(original="not valid json", compressed="[]")
-        results = store.search(hash_key, "query")
-        assert results == []
-
-    def test_search_plain_text_returns_matching_chunks(self, store: CompressionStore):
-        """search() can find content in Kompress-style plain-text originals."""
-        original = (
-            "The OpenAI handler contains def _compress_openai_responses_payload "
-            "for Responses API live-zone compression. Other text is irrelevant."
-        )
-        hash_key = store.store(original=original, compressed="compressed")
-
-        results = store.search(hash_key, "def _compress_openai_responses_payload")
-
-        assert len(results) == 1
-        assert results[0]["type"] == "text"
-        assert "_compress_openai_responses_payload" in results[0]["text"]
-
-    def test_search_json_object_returns_matching_leaf(self, store: CompressionStore):
-        """search() can find values inside JSON objects, not only arrays."""
-        original = json.dumps(
-            {
-                "module": {
-                    "name": "openai",
-                    "function": "_compress_openai_responses_payload",
-                }
-            }
-        )
-        hash_key = store.store(original=original, compressed="{}")
-
-        results = store.search(hash_key, "_compress_openai_responses_payload")
-
-        assert len(results) == 1
-        assert results[0]["path"] == "module.function"
-        assert results[0]["value"] == "_compress_openai_responses_payload"
-
-    def test_search_non_array_returns_empty(self, store: CompressionStore):
-        """search() returns empty for JSON objects without matching leaves."""
-        hash_key = store.store(original=json.dumps({"key": "value"}), compressed="{}")
-        results = store.search(hash_key, "query")
-        assert results == []
-
-    def test_search_empty_array_returns_empty(self, store: CompressionStore):
-        """search() returns empty for empty array."""
-        hash_key = store.store(original="[]", compressed="[]")
-        results = store.search(hash_key, "query")
-        assert results == []
-
-    def test_search_logs_retrieval_event(self, store: CompressionStore):
-        """search() logs retrieval event with search type."""
-        items = [{"id": 1, "content": "test"}]
-        hash_key = store.store(original=json.dumps(items), compressed="[]")
-
-        store.search(hash_key, "test query")
-
-        events = store.get_retrieval_events()
-        search_events = [e for e in events if e.retrieval_type == "search"]
-        assert len(search_events) >= 1
-        assert search_events[-1].query == "test query"
-
-
 # =============================================================================
 # Retrieval Events Tests
 # =============================================================================
@@ -1067,6 +1166,59 @@ class TestCompressionStoreRetrievalEvents:
         events = store.get_retrieval_events()
         assert len(events) >= 1
         assert events[-1].tool_signature_hash == "sig_123"
+
+    def test_history_past_the_cap_keeps_the_newest_in_order(self, store: CompressionStore):
+        """The cap drops the oldest events and nothing else.
+
+        ``_retrieval_events`` is capped by its container rather than by an
+        append-then-reslice, so this pins what the cap must still mean:
+        exactly ``_max_events`` retained, newest first, oldest discarded.
+        """
+        hash_key = store.store(original="[1]", compressed="[]")
+        overflow = 5
+        total = store._max_events + overflow
+
+        for i in range(total):
+            store.retrieve(hash_key, f"q{i}")
+
+        events = store.get_retrieval_events(limit=total)
+
+        assert len(events) == store._max_events
+        # get_retrieval_events returns newest first.
+        assert [e.query for e in events] == [f"q{i}" for i in reversed(range(overflow, total))]
+
+    @patch("headroom.cache.compression_feedback.get_compression_feedback")
+    @patch("headroom.telemetry.get_telemetry_collector")
+    @patch("headroom.telemetry.toin.get_toin")
+    def test_events_dropped_from_history_still_reach_feedback(
+        self, mock_toin, mock_telemetry, mock_feedback
+    ):
+        """Capping the display history must not cost a feedback notification.
+
+        ``_pending_feedback_events`` is a separate drain-by-swap queue that owes
+        a notification for every event, including the ones the bounded history
+        has already discarded. Bounding it too would silently lose feedback.
+        """
+        mock_feedback.return_value = MagicMock()
+        mock_telemetry.return_value = MagicMock()
+        mock_toin.return_value = MagicMock()
+
+        store = CompressionStore(enable_feedback=True)
+        hash_key = store.store(
+            original="[1]",
+            compressed="[]",
+            tool_signature_hash="sig_123",
+            compression_strategy="top_k",
+        )
+        overflow = 5
+        total = store._max_events + overflow
+
+        for i in range(total):
+            store.retrieve(hash_key, f"q{i}")
+
+        # One notification per retrieval, not one per surviving history entry.
+        assert mock_feedback.return_value.record_retrieval.call_count == total
+        assert len(store.get_retrieval_events(limit=total)) == store._max_events
 
 
 # =============================================================================
@@ -1128,6 +1280,10 @@ class TestCompressionStoreEdgeCases:
 
         stats = store.get_stats()
         assert stats["entry_count"] == 0
+        assert store._eviction_heap == []
+        assert store._expiration_heap == []
+        assert store._stale_heap_entries == 0
+        assert store._stale_expiration_heap_entries == 0
 
     def test_clear_removes_retrieval_events(self, store: CompressionStore):
         """clear() removes retrieval events."""
@@ -1337,7 +1493,7 @@ class TestCompressionStoreFeedback:
         store = CompressionStore(max_entries=2, enable_feedback=True)
 
         # Store entries with signature hash for eviction tracking
-        store.store(
+        first_hash = store.store(
             original="content_0",
             compressed="c0",
             tool_signature_hash="sig_0",
@@ -1364,6 +1520,9 @@ class TestCompressionStoreFeedback:
         # The evicted entry (content_0) was never retrieved,
         # so an eviction_success event should be queued
         # (tested via the pending_feedback mechanism)
+        assert len(store._pending_feedback_events) == 1
+        assert store._pending_feedback_events[0].hash == first_hash
+        assert store._pending_feedback_events[0].retrieval_type == "eviction_success"
 
 
 # =============================================================================
@@ -1383,7 +1542,7 @@ class TestRetrievalEvent:
             total_items=100,
             tool_name="search_api",
             timestamp=time.time(),
-            retrieval_type="search",
+            retrieval_type="full",
             tool_signature_hash="sig_123",
         )
 
@@ -1392,7 +1551,7 @@ class TestRetrievalEvent:
         assert event.items_retrieved == 5
         assert event.total_items == 100
         assert event.tool_name == "search_api"
-        assert event.retrieval_type == "search"
+        assert event.retrieval_type == "full"
         assert event.tool_signature_hash == "sig_123"
 
     def test_retrieval_event_default_signature_hash(self):

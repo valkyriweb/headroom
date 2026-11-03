@@ -30,11 +30,21 @@ from __future__ import annotations
 import re
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from .compression_strategy_outcomes import CompressionStrategyOutcomes
+
 if TYPE_CHECKING:
     from .compression_store import CompressionStore, RetrievalEvent
+
+# Cap on distinct tools tracked in ``_tool_patterns``. ``tool_name`` is
+# client-controlled — MCP servers can expose arbitrarily named tools — so the
+# outer key set is LRU-bounded like the interior per-pattern structures already
+# are (see LocalToolPattern's capped queries/fields/hashes). Well above the tool
+# count of any real deployment.
+_MAX_TRACKED_TOOLS = 1024
 
 
 @dataclass
@@ -94,28 +104,33 @@ class LocalToolPattern:
 
     def strategy_retrieval_rate(self, strategy: str) -> float:
         """Get retrieval rate for a specific compression strategy."""
-        compressions = self.strategy_compressions.get(strategy, 0)
-        if compressions == 0:
-            return 0.0
-        retrievals = self.strategy_retrievals.get(strategy, 0)
-        return retrievals / compressions
+        return self.strategy_outcomes.retrieval_rate(strategy)
 
     def best_strategy(self) -> str | None:
         """Find the strategy with lowest retrieval rate (most successful)."""
-        if not self.strategy_compressions:
-            return None
+        return self.strategy_outcomes.best_strategy()
 
-        best = None
-        best_rate = 1.0
+    @property
+    def strategy_outcomes(self) -> CompressionStrategyOutcomes:
+        """Strategy outcome view backed by this pattern's public counters."""
+        return CompressionStrategyOutcomes(
+            compressions=self.strategy_compressions,
+            retrievals=self.strategy_retrievals,
+        )
 
-        for strategy in self.strategy_compressions:
-            rate = self.strategy_retrieval_rate(strategy)
-            # Only consider strategies with enough samples
-            if self.strategy_compressions[strategy] >= 3 and rate < best_rate:
-                best_rate = rate
-                best = strategy
+    def record_strategy_compression(self, strategy: str) -> None:
+        """Record strategy compression outcome."""
+        outcomes = self.strategy_outcomes
+        outcomes.record_compression(strategy)
+        self.strategy_compressions = outcomes.compressions
+        self.strategy_retrievals = outcomes.retrievals
 
-        return best
+    def record_strategy_retrieval(self, strategy: str) -> None:
+        """Record strategy retrieval outcome."""
+        outcomes = self.strategy_outcomes
+        outcomes.record_retrieval(strategy)
+        self.strategy_compressions = outcomes.compressions
+        self.strategy_retrievals = outcomes.retrievals
 
 
 @dataclass
@@ -178,8 +193,10 @@ class CompressionFeedback:
         self._enable_learning = enable_learning
         self._lock = threading.Lock()
 
-        # Learned patterns per tool
-        self._tool_patterns: dict[str, LocalToolPattern] = {}
+        # Learned patterns per tool. LRU-ordered so the tracked-tool set can be
+        # capped (tool_name is client-controlled); most-recently-recorded tools
+        # stay, one-off tool names are evicted past _MAX_TRACKED_TOOLS.
+        self._tool_patterns: OrderedDict[str, LocalToolPattern] = OrderedDict()
 
         # Time-based tracking
         self._last_analysis: float = 0.0
@@ -200,6 +217,24 @@ class CompressionFeedback:
 
             self._store = get_compression_store()
         return self._store
+
+    def _touch_tool_pattern(self, tool_name: str) -> LocalToolPattern:
+        """Get-or-create a tool's pattern, LRU-capping the tracked-tool set.
+
+        ``tool_name`` is client-controlled, so the outer dict is bounded: past
+        ``_MAX_TRACKED_TOOLS`` the least-recently-recorded tool is evicted, and
+        recording a tool moves it to the most-recent end. The caller holds
+        ``self._lock``.
+        """
+        pattern = self._tool_patterns.get(tool_name)
+        if pattern is None:
+            if len(self._tool_patterns) >= _MAX_TRACKED_TOOLS:
+                self._tool_patterns.popitem(last=False)
+            pattern = LocalToolPattern(tool_name=tool_name)
+            self._tool_patterns[tool_name] = pattern
+        else:
+            self._tool_patterns.move_to_end(tool_name)
+        return pattern
 
     def record_compression(
         self,
@@ -226,24 +261,13 @@ class CompressionFeedback:
         with self._lock:
             self._total_compressions += 1
 
-            if tool_name not in self._tool_patterns:
-                self._tool_patterns[tool_name] = LocalToolPattern(tool_name=tool_name)
-
-            pattern = self._tool_patterns[tool_name]
+            pattern = self._touch_tool_pattern(tool_name)
             pattern.total_compressions += 1
             pattern.last_compression = time.time()
 
             # Track strategy usage
             if strategy:
-                pattern.strategy_compressions[strategy] = (
-                    pattern.strategy_compressions.get(strategy, 0) + 1
-                )
-
-                # CRITICAL FIX: When truncating strategy dicts, keep them in sync
-                # to prevent desync between compressions and retrievals.
-                # Both dicts must have the same keys for accurate retrieval rate calculation.
-                if len(pattern.strategy_compressions) > 50:
-                    self._truncate_strategy_dicts(pattern)
+                pattern.record_strategy_compression(strategy)
 
             # Track signature hash for TOIN correlation
             if tool_signature_hash:
@@ -274,13 +298,23 @@ class CompressionFeedback:
         if not tool_name:
             return
 
+        # An entry evicted without ever being retrieved is a compression
+        # SUCCESS, not a retrieval: the LLM never needed the original data (see
+        # CompressionStore._record_eviction_success). It arrives here as
+        # retrieval_type="eviction_success"; because that is not "full" it used
+        # to fall into the search_retrievals branch below and inflate
+        # retrieval_rate/search_rate, which drove get_compression_hints toward
+        # LESS aggressive compression -- the inverse of the intended signal. The
+        # compression itself was already counted by record_compression at store
+        # time, so a never-retrieved entry already yields a low retrieval rate;
+        # this event must not be counted as a retrieval.
+        if event.retrieval_type == "eviction_success":
+            return
+
         with self._lock:
             self._total_retrievals += 1
 
-            if tool_name not in self._tool_patterns:
-                self._tool_patterns[tool_name] = LocalToolPattern(tool_name=tool_name)
-
-            pattern = self._tool_patterns[tool_name]
+            pattern = self._touch_tool_pattern(tool_name)
             pattern.total_retrievals += 1
             pattern.last_retrieval = time.time()
 
@@ -291,14 +325,7 @@ class CompressionFeedback:
 
             # Track strategy retrievals (for success rate calculation)
             if strategy:
-                pattern.strategy_retrievals[strategy] = (
-                    pattern.strategy_retrievals.get(strategy, 0) + 1
-                )
-
-                # CRITICAL FIX: When truncating strategy dicts, keep them in sync
-                # to prevent desync between compressions and retrievals.
-                if len(pattern.strategy_retrievals) > 50:
-                    self._truncate_strategy_dicts(pattern)
+                pattern.record_strategy_retrieval(strategy)
 
             # Track query patterns
             if event.query:
@@ -316,42 +343,6 @@ class CompressionFeedback:
 
                 # Extract potential field names from query
                 self._extract_field_hints(pattern, event.query)
-
-    def _truncate_strategy_dicts(self, pattern: LocalToolPattern) -> None:
-        """Truncate strategy_compressions and strategy_retrievals in sync.
-
-        CRITICAL FIX: Both dicts must have the same keys for accurate retrieval
-        rate calculation. When truncating, we keep the union of top strategies
-        from both dicts, then truncate both to the same key set.
-        """
-        # Get top 40 strategies from each dict (using 40 to allow union to stay under 50)
-        top_compressions = {
-            k
-            for k, _ in sorted(
-                pattern.strategy_compressions.items(),
-                key=lambda x: x[1],
-                reverse=True,
-            )[:40]
-        }
-        top_retrievals = {
-            k
-            for k, _ in sorted(
-                pattern.strategy_retrievals.items(),
-                key=lambda x: x[1],
-                reverse=True,
-            )[:40]
-        }
-
-        # Keep union of top strategies from both
-        keys_to_keep = top_compressions | top_retrievals
-
-        # Truncate both dicts to same keys
-        pattern.strategy_compressions = {
-            k: v for k, v in pattern.strategy_compressions.items() if k in keys_to_keep
-        }
-        pattern.strategy_retrievals = {
-            k: v for k, v in pattern.strategy_retrievals.items() if k in keys_to_keep
-        }
 
     def _extract_field_hints(self, pattern: LocalToolPattern, query: str) -> None:
         """Extract potential field names from search queries.

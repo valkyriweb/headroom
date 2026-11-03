@@ -10,7 +10,6 @@ from headroom.cache.compression_store import get_compression_store, reset_compre
 from headroom.telemetry import (
     TOINConfig,
     ToolIntelligenceNetwork,
-    ToolPattern,
     ToolSignature,
     get_toin,
     reset_toin,
@@ -73,101 +72,12 @@ def test_kompress_ccr_retrieval_updates_toin():
     entry = store.retrieve(hash_key)
     assert entry is not None
     assert entry.tool_signature_hash is not None
-
-    results = store.search(hash_key, "HEADROOM", score_threshold=0.0)
-    assert results
+    # Retrieval is by hash and returns the full original content.
+    assert "HEADROOM" in entry.original_content
 
     stats = get_toin().get_stats()
     assert stats["total_compressions"] == 1
-    assert stats["total_retrievals"] == 2
-
-
-@pytest.mark.skip(reason="PR-B5: observations counter and request-time hint API retired")
-class TestGetRecommendationObservations:
-    """Bug 1: get_recommendation() should increment observations counter."""
-
-    def test_increments_observations_when_pattern_exists(self):
-        """get_recommendation() should increment observations when pattern exists."""
-        config = _make_config(min_samples=5)
-        toin = ToolIntelligenceNetwork(config=config)
-        sig = _make_signature("obs_test_hash")
-
-        # Record enough compressions to create a pattern with sufficient samples
-        for _ in range(15):
-            toin.record_compression(
-                tool_signature=sig,
-                original_count=100,
-                compressed_count=20,
-                original_tokens=5000,
-                compressed_tokens=1000,
-                strategy="top_n",
-            )
-
-        # Get recommendation
-        toin.get_recommendation(sig)
-
-        # Check observations incremented
-        pattern = toin._patterns[("unknown", "unknown", sig.structure_hash)]
-        assert pattern.observations == 1
-
-        # Call again
-        toin.get_recommendation(sig)
-        assert pattern.observations == 2
-
-    def test_increments_observations_even_below_min_samples(self):
-        """observations increments even when sample_size < min_samples."""
-        config = _make_config(min_samples=100)
-        toin = ToolIntelligenceNetwork(config=config)
-        sig = _make_signature("low_sample_hash")
-
-        # Record just a few compressions (below min_samples)
-        for _ in range(3):
-            toin.record_compression(
-                tool_signature=sig,
-                original_count=50,
-                compressed_count=10,
-                original_tokens=2000,
-                compressed_tokens=500,
-                strategy="top_n",
-            )
-
-        result = toin.get_recommendation(sig)
-        assert result.source == "local"  # Not enough samples
-
-        pattern = toin._patterns[("unknown", "unknown", sig.structure_hash)]
-        assert pattern.observations == 1
-
-    def test_no_increment_for_unknown_pattern(self):
-        """get_recommendation() should NOT increment for unknown patterns."""
-        config = _make_config()
-        toin = ToolIntelligenceNetwork(config=config)
-        sig = _make_signature("nonexistent_hash")
-
-        result = toin.get_recommendation(sig)
-        assert result.source == "default"
-        assert result.reason == "No pattern data for this tool type"
-
-        # No pattern exists, nothing to increment
-        assert "nonexistent_hash" not in toin._patterns
-
-    def test_observations_survives_serialization(self):
-        """observations field should serialize and deserialize correctly."""
-        pattern = ToolPattern(
-            tool_signature_hash="serial_test",
-            total_compressions=10,
-            observations=42,
-        )
-
-        d = pattern.to_dict()
-        assert d["observations"] == 42
-
-        restored = ToolPattern.from_dict(d)
-        assert restored.observations == 42
-
-    def test_observations_defaults_to_zero(self):
-        """observations defaults to 0 for new patterns."""
-        pattern = ToolPattern(tool_signature_hash="new_pattern")
-        assert pattern.observations == 0
+    assert stats["total_retrievals"] == 1
 
 
 class TestRecordRetrievalPopulatesFields:
@@ -200,7 +110,7 @@ class TestRecordRetrievalPopulatesFields:
                 query_fields=["error_message"],
             )
 
-        pattern = toin._patterns[("unknown", "unknown", sig_hash)]
+        pattern = toin._patterns[("global", "unknown", "unknown", sig_hash)]
         assert pattern.total_retrievals == 5
         assert pattern.search_retrievals == 5
         assert len(pattern.field_retrieval_frequency) > 0
@@ -218,7 +128,7 @@ class TestCCRFeedbackExtraction:
                     "type": "tool_use",
                     "id": "toolu_123",
                     "name": "headroom_retrieve",
-                    "input": {"hash": "abc123def456", "query": "error fields"},
+                    "input": {"hash": "abc123def456"},
                 },
             ]
         }
@@ -236,7 +146,6 @@ class TestCCRFeedbackExtraction:
 
         assert len(retrieve_calls) == 1
         assert retrieve_calls[0]["hash"] == "abc123def456"
-        assert retrieve_calls[0]["query"] == "error fields"
 
     def test_ignore_non_retrieve_tool_calls(self):
         """Should ignore tool_use blocks that are not headroom_retrieve."""
@@ -252,7 +161,7 @@ class TestCCRFeedbackExtraction:
                     "type": "tool_use",
                     "id": "toolu_789",
                     "name": "headroom_retrieve",
-                    "input": {"hash": "xyz789", "query": None},
+                    "input": {"hash": "xyz789"},
                 },
             ]
         }
@@ -313,8 +222,12 @@ class TestCCRFeedbackExtraction:
 class TestStreamingFeedbackIntegration:
     """Bug 2: Full feedback loop — streaming headroom_retrieve reaches TOIN."""
 
-    def test_record_ccr_feedback_calls_store_search(self):
-        """_record_ccr_feedback_from_response should call store.search for queries."""
+    def test_record_ccr_feedback_calls_store_retrieve(self):
+        """_record_ccr_feedback_from_response calls store.retrieve by hash.
+
+        Retrieval is by hash only — any legacy ``query`` in the tool input is
+        ignored, and the full content is fetched for the feedback side effect.
+        """
         from headroom.proxy.server import HeadroomProxy
 
         response = {
@@ -340,10 +253,11 @@ class TestStreamingFeedbackIntegration:
 
             proxy._record_ccr_feedback_from_response(response, "anthropic", "req-test-001")
 
-        mock_store.search.assert_called_once_with("feedbackhash1", "error details")
+        mock_store.retrieve.assert_called_once_with("feedbackhash1")
+        mock_store.search.assert_not_called()
 
     def test_record_ccr_feedback_calls_store_retrieve_no_query(self):
-        """_record_ccr_feedback_from_response should call store.retrieve when no query."""
+        """_record_ccr_feedback_from_response calls store.retrieve by hash."""
         from headroom.proxy.server import HeadroomProxy
 
         response = {
@@ -368,7 +282,7 @@ class TestStreamingFeedbackIntegration:
 
             proxy._record_ccr_feedback_from_response(response, "anthropic", "req-test-002")
 
-        mock_store.retrieve.assert_called_once_with("feedbackhash2", query=None)
+        mock_store.retrieve.assert_called_once_with("feedbackhash2")
 
     def test_record_ccr_feedback_handles_store_exception(self):
         """_record_ccr_feedback_from_response should not raise on store errors."""
@@ -380,13 +294,13 @@ class TestStreamingFeedbackIntegration:
                     "type": "tool_use",
                     "id": "toolu_003",
                     "name": "headroom_retrieve",
-                    "input": {"hash": "feedbackhash3", "query": "test"},
+                    "input": {"hash": "feedbackhash3"},
                 },
             ]
         }
 
         mock_store = MagicMock()
-        mock_store.search.side_effect = RuntimeError("store unavailable")
+        mock_store.retrieve.side_effect = RuntimeError("store unavailable")
         with patch(
             "headroom.cache.compression_store.get_compression_store",
             return_value=mock_store,
@@ -417,7 +331,7 @@ class TestParseSSEToolUse:
             "\n"
             'data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_abc","name":"headroom_retrieve"}}\n'
             "\n"
-            'data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"hash\\": \\"abc123\\", \\"query\\": \\"error\\"}"}}\n'
+            'data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"hash\\": \\"abc123\\"}"}}\n'
             "\n"
             'data: {"type":"content_block_stop","index":1}\n'
             "\n"
@@ -439,7 +353,6 @@ class TestParseSSEToolUse:
         assert tool_block["name"] == "headroom_retrieve"
         assert tool_block["id"] == "toolu_abc"
         assert tool_block["input"]["hash"] == "abc123"
-        assert tool_block["input"]["query"] == "error"
 
     def test_parse_sse_non_anthropic_returns_none(self):
         """Non-anthropic provider should return None."""

@@ -81,6 +81,12 @@ class TestConvertToolChoice:
         result = _convert_tool_choice({"type": "tool", "name": "get_weather"})
         assert result == {"type": "function", "function": {"name": "get_weather"}}
 
+    def test_none_dict_not_inverted_to_auto(self):
+        # Anthropic sends {"type": "none"} to forbid tool use this turn. It must
+        # map to OpenAI's "none", not fall through to the "auto" default (which
+        # would let the model call a tool the client explicitly disallowed).
+        assert _convert_tool_choice({"type": "none"}) == "none"
+
     def test_string_passthrough(self):
         assert _convert_tool_choice("auto") == "auto"
         assert _convert_tool_choice("none") == "none"
@@ -274,6 +280,33 @@ class TestConvertMessagesToolBlocks:
         assert converted[0]["role"] == "tool"
         assert converted[0]["content"] == "Line 1\nLine 2"
 
+    def test_tool_result_list_content_with_bare_string_block(self):
+        """A tool_result content list may contain a bare string, not just
+        ``{"type":"text",...}`` blocks. ``b.get`` on a str raised AttributeError
+        and 500'd the whole request; bare strings must be accepted and other
+        block types skipped."""
+        backend = self._make_backend()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_03",
+                        "content": [
+                            "bare string result",
+                            {"type": "text", "text": "typed block"},
+                            {"type": "image", "source": {"type": "base64", "data": "x"}},
+                        ],
+                    },
+                ],
+            },
+        ]
+        converted = backend._convert_messages_for_litellm(messages)
+        assert converted[0]["role"] == "tool"
+        # bare string + text block joined; the image block is skipped.
+        assert converted[0]["content"] == "bare string result\ntyped block"
+
     def test_assistant_tool_use_with_text(self):
         """Assistant message with both text and tool_use blocks."""
         backend = self._make_backend()
@@ -397,6 +430,71 @@ class TestConvertMessagesToolBlocks:
         assert converted[0]["role"] == "tool"
         assert converted[0]["tool_call_id"] == "toolu_01"
         assert converted[0]["content"] == "42"
+
+
+class TestConvertMessagesImageBlocks:
+    """Anthropic image blocks must survive _convert_messages_for_litellm."""
+
+    PNG_B64 = "iVBORw0KGgo="
+
+    def _make_backend(self):
+        with patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}):
+            return LiteLLMBackend(provider="bedrock")
+
+    def test_text_and_image_turn_keeps_image(self):
+        """The image reaches the Bedrock Converse body instead of being dropped."""
+        from litellm.litellm_core_utils.prompt_templates.factory import (
+            _bedrock_converse_messages_pt,
+        )
+
+        backend = self._make_backend()
+        image = {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": self.PNG_B64},
+        }
+        messages = [
+            {"role": "user", "content": [image, {"type": "text", "text": "What color?"}]},
+        ]
+        converted = backend._convert_messages_for_litellm(messages)
+
+        assert converted[0]["content"] == [
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{self.PNG_B64}"}},
+            {"type": "text", "text": "What color?"},
+        ]
+        converse = _bedrock_converse_messages_pt(
+            messages=converted, model="us.openai.gpt-6-sol", llm_provider="bedrock_converse"
+        )
+        assert [list(block) for block in converse[0]["content"]] == [["image"], ["text"]]
+
+    def test_image_only_turn_is_not_emptied(self):
+        """An image-only turn must not become "" (litellm then drops the turn)."""
+        backend = self._make_backend()
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": "Describe the next image."}]},
+            {"role": "assistant", "content": "Send it."},
+            {
+                "role": "user",
+                "content": [{"type": "image", "source": {"type": "url", "url": "https://x/a.png"}}],
+            },
+        ]
+        converted = backend._convert_messages_for_litellm(messages)
+
+        # Text-only block lists still flatten to a string, as before.
+        assert converted[0]["content"] == "Describe the next image."
+        assert converted[2]["content"] == [
+            {"type": "image_url", "image_url": {"url": "https://x/a.png"}},
+        ]
+
+    def test_assistant_turn_image_is_still_dropped(self):
+        """Assistant-turn images keep the old text-only content (litellm's Bedrock
+        transform raises on them)."""
+        backend = self._make_backend()
+        image = {"type": "image", "source": {"type": "url", "url": "https://x/a.png"}}
+        messages = [
+            {"role": "assistant", "content": [image, {"type": "text", "text": "Here is one."}]},
+        ]
+        converted = backend._convert_messages_for_litellm(messages)
+        assert converted[0]["content"] == "Here is one."
 
 
 # =============================================================================
@@ -820,3 +918,157 @@ class TestBedrockApiKeyNotForwarded:
                 kwargs["api_key"] = headers["x-api-key"]
 
         assert "api_key" not in kwargs
+
+
+# =============================================================================
+# Bedrock Converse Oversized Tool Name Filtering
+# =============================================================================
+
+
+class TestBedrockOversizedToolNameFiltering:
+    """Bedrock Converse hard-rejects any request containing a tool name over
+    64 chars. Claude Code includes every globally-added claude.ai MCP
+    connector tool in every request, even disabled ones, so a single
+    oversized name would 401 the whole call. Tools over the limit must be
+    dropped before the LiteLLM call, only for the ``bedrock`` provider.
+    """
+
+    def _make_response(self):
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(message=MagicMock(content="ok", tool_calls=None), finish_reason="stop")
+        ]
+        mock_response.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
+        return mock_response
+
+    @pytest.mark.asyncio
+    async def test_send_message_drops_oversized_tool_name_on_bedrock(self):
+        with (
+            patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
+            patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+        ):
+            mock_acomp.return_value = self._make_response()
+
+            backend = LiteLLMBackend(provider="bedrock", region="us-west-2")
+            body = {
+                "model": "claude-3-5-sonnet-20241022",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [
+                    {"name": "short_tool", "input_schema": {"type": "object"}},
+                    {"name": "x" * 65, "input_schema": {"type": "object"}},
+                ],
+            }
+
+            await backend.send_message(body, {})
+
+            call_kwargs = mock_acomp.call_args[1]
+            names = [t["function"]["name"] for t in call_kwargs["tools"]]
+            assert names == ["short_tool"]
+
+    @pytest.mark.asyncio
+    async def test_send_message_keeps_exactly_64_chars_on_bedrock(self):
+        with (
+            patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
+            patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+        ):
+            mock_acomp.return_value = self._make_response()
+
+            backend = LiteLLMBackend(provider="bedrock", region="us-west-2")
+            name_64 = "y" * 64
+            body = {
+                "model": "claude-3-5-sonnet-20241022",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": name_64, "input_schema": {"type": "object"}}],
+            }
+
+            await backend.send_message(body, {})
+
+            call_kwargs = mock_acomp.call_args[1]
+            names = [t["function"]["name"] for t in call_kwargs["tools"]]
+            assert names == [name_64]
+
+    @pytest.mark.asyncio
+    async def test_send_message_does_not_filter_on_non_bedrock(self):
+        """The 64-char limit is a Bedrock Converse API constraint; other
+        providers must forward oversized tool names unfiltered."""
+        with (
+            patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
+            patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+        ):
+            mock_acomp.return_value = self._make_response()
+
+            backend = LiteLLMBackend(provider="openrouter")
+            oversized = "z" * 65
+            body = {
+                "model": "claude-3-5-sonnet-20241022",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": oversized, "input_schema": {"type": "object"}}],
+            }
+
+            await backend.send_message(body, {})
+
+            call_kwargs = mock_acomp.call_args[1]
+            names = [t["function"]["name"] for t in call_kwargs["tools"]]
+            assert names == [oversized]
+
+    @pytest.mark.asyncio
+    async def test_stream_message_drops_oversized_tool_name_on_bedrock(self):
+        async def mock_stream():
+            chunk = MagicMock()
+            chunk.choices = [
+                MagicMock(delta=MagicMock(content="hi", tool_calls=None), finish_reason="stop")
+            ]
+            yield chunk
+
+        with (
+            patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
+            patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+        ):
+            mock_acomp.return_value = mock_stream()
+
+            backend = LiteLLMBackend(provider="bedrock", region="us-west-2")
+            body = {
+                "model": "claude-3-5-sonnet-20241022",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [
+                    {"name": "short_tool", "input_schema": {"type": "object"}},
+                    {"name": "w" * 65, "input_schema": {"type": "object"}},
+                ],
+            }
+
+            events = [event async for event in backend.stream_message(body, {})]
+            assert events  # sanity: stream produced output
+
+            call_kwargs = mock_acomp.call_args[1]
+            names = [t["function"]["name"] for t in call_kwargs["tools"]]
+            assert names == ["short_tool"]
+
+    @pytest.mark.asyncio
+    async def test_stream_message_does_not_filter_on_non_bedrock(self):
+        async def mock_stream():
+            chunk = MagicMock()
+            chunk.choices = [
+                MagicMock(delta=MagicMock(content="hi", tool_calls=None), finish_reason="stop")
+            ]
+            yield chunk
+
+        with (
+            patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
+            patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+        ):
+            mock_acomp.return_value = mock_stream()
+
+            backend = LiteLLMBackend(provider="openrouter")
+            oversized = "v" * 65
+            body = {
+                "model": "claude-3-5-sonnet-20241022",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": oversized, "input_schema": {"type": "object"}}],
+            }
+
+            events = [event async for event in backend.stream_message(body, {})]
+            assert events
+
+            call_kwargs = mock_acomp.call_args[1]
+            names = [t["function"]["name"] for t in call_kwargs["tools"]]
+            assert names == [oversized]
